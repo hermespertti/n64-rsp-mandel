@@ -11,19 +11,22 @@ emulator's headless test runner.
 
 ![zoom tour into seahorse valley](mandel/docs_shots/zoom_tour.gif)
 
-*(36 keyframe captures from the headless runner, 320×240 upscaled — home view →
-seahorse valley dive → elephant valley wing → pull back; smooth palette, `mism=0`
-verified at every sampled frame)*
+*(headless-runner captures — home view → seahorse valley dive → **deep tail view at
+span 5×10⁻⁵, ~50,000× magnification** (CPU double pipeline) → elephant valley wing →
+pull back; smooth palette, RSP frames `mism=0`, deep frame 99.67% numpy-agreement)*
 
 ## What's here
 
 | Path | What |
 |---|---|
 | `mandel/main.c` | CPU side: stage packing, DMEM upload, readback, verify pass, mirroring paint, palette/smooth LUTs, direct ISViewer debug channel |
-| `mandel/rsp_mandel.S` | the custom RSP ucode (q11 fixed point, `vmudm` exact squares, VCO borrow-chain escape freeze) |
+| `mandel/rsp_mandel.S` | the custom RSP ucode (q12 fixed point, `vmudm` exact squares, VCO borrow-chain escape freeze) |
 | `mandel/test/probe.js` | headless test script for the ares-64 `ares-test` JS runner |
+| `mandel/test/deepcap.js` | deep-zoom frame capture (boots at `START_FRAME=…`) |
+| `mandel/test/deepcheck.py` | numpy double-precision cross-check of deep frames |
 | `mandel/DESIGN.md` | original ucode design spec |
 | `tools/n64test_ares.sh` | xvfb harness for official Ares captures |
+| `tools/ci.sh` | build + headless run + fail on `mism!=0` or magenta verify pixels |
 
 ## The ucode
 
@@ -47,9 +50,12 @@ Optimizations in use:
 - **smooth coloring** — the ucode also emits the exact escape radius `S`; the CPU maps
   it through a 32 K-entry `log₂log` LUT → continuous palette coordinate, no per-pixel logs
 - **zoom tour** — keyframe animation (seahorse valley, elephant valley wing) with
-  geometric span interpolation = constant octave-rate zoom; view coordinates packed on
-  the CPU in double precision, so the stage is exact at any depth (iteration depth
-  cap ≈ span 0.02 at q12; deeper needs `vmad` 32-bit accumulator chaining — roadmap)
+  geometric span interpolation = constant octave-rate zoom
+- **hybrid deep zoom** — RSP q12 handles spans ≥ 0.078 in vector hardware; deeper
+  views (down to span 5e-5, ~50,000× magnification) switch to a CPU double-precision
+  pipeline with depth-scaled iteration counts, verified against a numpy reference
+  (99.67% interior/exterior agreement at the seahorse-tail keyframe). q12 deep-zoom
+  via `vmad` accumulator chaining remains on the roadmap
 - precomputed coordinate/palette LUTs, escape-freeze lane masking, single DMA readback
 
 ## Validation

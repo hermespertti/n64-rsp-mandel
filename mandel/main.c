@@ -101,13 +101,23 @@ typedef struct { double cx, cy, span; int hold; } Key;
 static const Key keys[] = {
     { -0.700000,  0.000000, 2.600,  45 },   /* home */
     { -0.743500, -0.131400, 0.0800, 30 },  /* seahorse valley entry */
-    { -0.745800, -0.114900, 0.0200, 45 },  /* seahorse bodies */
-    { -0.744500, -0.116000, 0.0500, 20 },  /* shift + pull back */
+    { -0.745800, -0.114900, 0.0200, 45 },  /* seahorse bodies (RSP) */
+    { -0.7436438870371, 0.1318259042053, 5e-5, 60 }, /* SEAHORSE TAIL — CPU */
+    { -0.745800, -0.114900, 0.0200, 20 },  /* pull back to RSP range */
     { -0.235125,  0.827215, 0.0200, 40 },  /* elephant valley wing */
     { -0.700000,  0.000000, 2.600,  60 },  /* back home, park */
 };
 #define NKEY ((int)(sizeof(keys)/sizeof(keys[0])))
 #define MOVE_FRAMES 150
+
+/* RSP q12 iteration is exact only while the per-pixel step is ≥ quantum
+   2^-12 ⇒ span ≥ 320·2^-12 = 0.078; below that deeper views run the CPU
+   double path (seahorse-tail grade coordinates). */
+#define RSP_MIN_SPAN 0.078
+
+#ifndef START_FRAME
+#define START_FRAME 0
+#endif
 
 static double view_x0 = -2.0, view_x1 = 0.6;   /* home view (verify ref) */
 
@@ -148,9 +158,11 @@ static void build_palette(void)
     }
 }
 
+static int g_interior = 120;               /* counts ≥ this = interior */
+
 static inline uint32_t smooth_color(int n, uint16_t S)
 {
-    if (n >= MAXITER) return color_to_packed32(RGBA32(8, 4, 16, 255));
+    if (n >= g_interior) return color_to_packed32(RGBA32(8, 4, 16, 255));
     int sm = n * 4096 + (int)smooth_tab[S > 32767 ? 32767 : S];
     int idx = (sm * 4) >> 11;
     return pal_lut[idx & (PALN - 1)];
@@ -205,7 +217,7 @@ int main(void)
     rsp_load_data(stage, sizeof(stage), 0);
 #endif
 
-    long frame = 0;
+    long frame = START_FRAME;
     long long us_rsp = 0, us_pack = 0, us_paint = 0;
 
     printf("[n64] mandel stage-E boot: %dx%d zoom tour NKEY=%d verify=%d\n",
@@ -218,104 +230,96 @@ int main(void)
         double cx0, cy0, span;
         view_at(frame, &cx0, &cy0, &span);
         double dx = span / W, dy = span / H;
+        double x0 = cx0 - span / 2, y0 = cy0 - span / 2;
 
         long long t0 = timer_ticks();
         for (int x = 0; x < W; x++)
-            cxq[x] = (uint16_t)q12(cx0 - span / 2 + dx * x);
+            cxq[x] = (uint16_t)q12(x0 + dx * x);
         for (int y = 0; y < H; y++)
-            cyq[y] = (uint16_t)q12(cy0 - span / 2 + dy * y);
-        /* save home-view bounds when parked at home (span >= 2) */
-        if (span >= 2.0 && cy0 == 0.0) {
-            view_x0 = cx0 - span / 2; view_x1 = cx0 + span / 2;
-        }
+            cyq[y] = (uint16_t)q12(y0 + dy * y);
         us_pack += TIMER_MICROS_LL(timer_ticks() - t0);
 
+        int use_rsp = 0;
 #if USE_RSP
-        memcpy(&stage[XLUT_HW], cxq, sizeof(cxq));
-        /* STAGE F: two rows per rsp_run (ci-pair @0x0CB0/0x0CC0) */
-        int rowmax = H;
-        int mirror = 0;
-        double ytop = cy0 - span / 2;
-        double ybot = cy0 + span / 2;
-        if (ytop >= 0.0) {
-            mirror = 0;         /* whole view above axis: no pairing possible */
-            rowmax = H;
-        } else if (fabs(ytop + ybot) < 1e-9) {
-            mirror = 1;         /* symmetric about real axis: compute rows 0..H/2 */
-            rowmax = H / 2 + 1;
-        } else {
-            mirror = 0;
-            rowmax = H;
-        }
-
-        for (int y = 0; y < rowmax; y += 2) {
-            uint16_t c0 = cyq[y];
-            uint16_t c1 = (y + 1 < rowmax) ? cyq[y + 1] : c0;
-            for (int i = 0; i < 8; i++) {
-                stage[CI0_HW + i] = c0;
-                stage[CI0_HW + 8 + i] = c1;
-            }
-            data_cache_hit_writeback_invalidate(stage, sizeof(stage));
-
-            rsp_load_data(stage, sizeof(stage), 0);
-            t0 = timer_ticks();
-            rsp_run();
-            rsp_read_data(rdbuf, sizeof(rdbuf), OUT_BYTE);
-            us_rsp += TIMER_MICROS_LL(timer_ticks() - t0);
-            int y2 = y + 1;
-            memcpy(rows_cnt[y], rdbuf, W * 2);
-            memcpy(rows_s[y], rdbuf + W, W * 2);
-            if (y2 < rowmax) {
-                memcpy(rows_cnt[y2], rdbuf + 2 * W, W * 2);
-                memcpy(rows_s[y2], rdbuf + 3 * W, W * 2);
-            }
-        }
-
-        int minc = 999, maxc = 0, mismatch = 0;
-        int mm_y[8], mm_x[8], mm_r[8], mm_v[8], mmc = 0;
-        for (int y = 0; y < rowmax; y++)
-            for (int x = 0; x < W; x++) {
-                int v = rows_cnt[y][x];
-                if (v < minc) minc = v;
-                if (v > maxc) maxc = v;
-#if VERIFY
-                int ref = mandel_q12((int)(int16_t)cxq[x], (int)(int16_t)cyq[y]);
-                if (v != ref) {
-                    mismatch++;
-                    if (mmc < 8) { mm_y[mmc]=y; mm_x[mmc]=x; mm_r[mmc]=ref; mm_v[mmc]=v; mmc++; }
-                }
+        use_rsp = span >= RSP_MIN_SPAN;
 #endif
-            }
-        if (mmc) {
-            printf("[mm] ");
-            for (int i = 0; i < mmc; i++)
-                printf("y%d x%d rom=%d ref=%d(cr=%d ci=%d) ", mm_y[i], mm_x[i],
-                       mm_v[i], mm_r[i], (int)(int16_t)cxq[mm_x[i]], (int)cyq[mm_y[i]]);
-            printf("\n");
-        }
-#else
+        int iters = (int)(60.0 + 90.0 * log2(2.6 / (span < 1e-9 ? 1e-9 : span)));
+        if (iters < MAXITER) iters = MAXITER;
+        if (iters > 1200) iters = 1200;
+
         int rowmax = H, mirror = 0;
-        for (int y = 0; y < rowmax; y++) {
-            for (int x = 0; x < W; x++) {
-                int cr = (int)(int16_t)cxq[x], ci = (int)(int16_t)cyq[y];
-                int zr = 0, zi = 0, S = 0, cnt = MAXITER;
-                for (int i = 0; i < MAXITER; i++) {
-                    int32_t zr2 = ((int32_t)zr * zr) >> 16;
-                    int32_t zi2 = ((int32_t)zi * zi) >> 16;
-                    S = zr2 + zi2;
-                    if (S >= 1024) { cnt = i; break; }
-                    int32_t s = (int32_t)zr + zi;
-                    int32_t cr2 = (s * s) >> 16;
-                    int32_t cross = cr2 - zr2 - zi2;
-                    int32_t d = zr2 - zi2;
-                    zr = sat16((d << 4) + cr);
-                    zi = sat16((cross << 4) + ci);
+        int mismatch = 0, maxc = 0;
+        g_interior = use_rsp ? 120 : iters;   /* ucode saturates at NITER=120 */
+
+#if USE_RSP
+        if (use_rsp) {
+            memcpy(&stage[XLUT_HW], cxq, sizeof(cxq));
+            double ytop = y0, ybot = cy0 + span / 2;
+            if (ytop >= 0.0) {
+                mirror = 0;
+            } else if (fabs(ytop + ybot) < 1e-9) {
+                mirror = 1;
+                rowmax = H / 2 + 1;
+            }
+
+            for (int y = 0; y < rowmax; y += 2) {
+                uint16_t c0 = cyq[y];
+                uint16_t c1 = (y + 1 < rowmax) ? cyq[y + 1] : c0;
+                for (int i = 0; i < 8; i++) {
+                    stage[CI0_HW + i] = c0;
+                    stage[CI0_HW + 8 + i] = c1;
                 }
-                rows_cnt[y][x] = (uint16_t)cnt;
-                rows_s[y][x] = (uint16_t)(S > 32767 ? 32767 : S);
+                data_cache_hit_writeback_invalidate(stage, sizeof(stage));
+
+                rsp_load_data(stage, sizeof(stage), 0);
+                t0 = timer_ticks();
+                rsp_run();
+                rsp_read_data(rdbuf, sizeof(rdbuf), OUT_BYTE);
+                us_rsp += TIMER_MICROS_LL(timer_ticks() - t0);
+                int y2 = y + 1;
+                memcpy(rows_cnt[y], rdbuf, W * 2);
+                memcpy(rows_s[y], rdbuf + W, W * 2);
+                if (y2 < rowmax) {
+                    memcpy(rows_cnt[y2], rdbuf + 2 * W, W * 2);
+                    memcpy(rows_s[y2], rdbuf + 3 * W, W * 2);
+                }
+            }
+
+            for (int y = 0; y < rowmax; y++)
+                for (int x = 0; x < W; x++) {
+                    int v = rows_cnt[y][x];
+                    if (v > maxc) maxc = v;
+#if VERIFY
+                    if (v != mandel_q12((int)(int16_t)cxq[x], (int)(int16_t)cyq[y]))
+                        mismatch++;
+#endif
+                }
+        }
+#endif /* USE_RSP */
+
+        if (!use_rsp) {
+            /* deep view: CPU double pipeline, full coordinate precision */
+            for (int y = 0; y < H; y++) {
+                double ci = y0 + dy * y;
+                for (int x = 0; x < W; x++) {
+                    double cr = x0 + dx * x;
+                    double zr = 0, zi = 0, S = 0;
+                    int cnt = iters;
+                    for (int i = 0; i < iters; i++) {
+                        double r2 = zr * zr, i2 = zi * zi;
+                        S = r2 + i2;
+                        if (S >= 4.0) { cnt = i; break; }
+                        double t = r2 - i2;
+                        zi = 2.0 * zr * zi + ci;
+                        zr = t + cr;
+                    }
+                    rows_cnt[y][x] = (uint16_t)cnt;
+                    if (cnt > maxc) maxc = cnt;
+                    int s8 = (int)(S * 1024.0);
+                    rows_s[y][x] = (uint16_t)(s8 > 32767 ? 32767 : (s8 < 0 ? 0 : s8));
+                }
             }
         }
-#endif
 
         long long t1 = timer_ticks();
         for (int y = 0; y < rowmax; y++) {
@@ -323,10 +327,8 @@ int main(void)
             uint16_t *cn = rows_cnt[y], *ss = rows_s[y];
             for (int x = 0; x < W; x++) d[x] = smooth_color(cn[x], ss[x]);
         }
-        /* mirrored paint: row y (ci) shares count with row mirroring -ci */
         if (mirror) {
             for (int y = 0; y < rowmax; y++) {
-                /* find symmetric row index where cyq = -cyq[y] */
                 int ys = (H - 1) - y;
                 if (ys >= H) continue;
                 uint32_t *d = pix + (size_t)ys * W;
@@ -339,8 +341,9 @@ int main(void)
         if ((frame % 60) == 0) {
             char line[256];
             int n = snprintf(line, sizeof(line),
-                "[probe] f=%ld cx=%.6f cy=%.6f span=%.5f mism=%d max=%d rsp_ms=%lld\n",
-                (long)frame, cx0, cy0, span, mismatch, maxc,
+                "[probe] f=%ld cx=%.9f cy=%.9f span=%.8f path=%s mism=%d max=%d it=%d rsp_ms=%lld\n",
+                (long)frame, cx0, cy0, span, use_rsp ? "rsp" : "cpu",
+                mismatch, maxc, iters,
                 (long long)(us_rsp / 1000));
             static uint8_t isvbuf[256] __attribute__((aligned(8)));
             for (int i = 0; i < n; i++) isvbuf[i] = (uint8_t)line[i];
