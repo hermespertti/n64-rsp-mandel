@@ -17,6 +17,15 @@
  * Escaped lanes FREEZE (VCO borrow-chain) so the post-loop S store is
  * exactly S(z_esc) → feeds the CPU smooth-color LUT.
  *
+ * STAGE K: PER-CHUNK EARLY-OUT. After the escape mask is computed, the
+ * live mask (v12) is stored to DMEM scratch and scalar-OR'd across ALL
+ * FOUR words (16 bytes = 8 lanes — reading only 2 words missed lanes
+ * 2-3/6-7 and broke exactness: mism=688!). If zero, every lane is
+ * frozen: the remaining iterations would recompute the same z, add 0 to
+ * cnt, and leave S final → break is bit-exact. Home view: 892→338 µs
+ * (2.6×). The check is scalar-only ops so the vector VCIN chain that
+ * feeds vadd folding is untouched.
+ *
  * GOTCHAS (verified vs ares interpreter-vpu.cpp / decoder.cpp):
  *   lhv/shv = stride-2 scatter, NOT contiguous → use lqv/sqv.
  *   vabs THREE-operand (vd = vs<0?-vt : vt) → pass vt = vs.
@@ -78,6 +87,7 @@ nc_ok:
     li   s2, 0x0280              /* row0 sout cursor */
     li   s4, 2                   /* rows in this run */
     li   s1, 0x0D80              /* probe base */
+    li   s7, 0x0CE0              /* K: live-mask scratch (8 lanes) */
 
 row:
     lqv  $v03, 0x00, s6          /* ci 8 lanes q12 */
@@ -99,7 +109,7 @@ loop:
     vabs  $v08, $v05, $v05
     vmudm $v07, $v08, $v08       /* zi² q8 */
 
-    vadd  $v08, $v04, $v05       /* (zr+zi): folds VCOL(=0), clears */
+    vadd  $v08, $v04, $v05       /* (zr+zi): folds prior VCIN */
     vabs  $v08, $v08, $v08
     vmudm $v14, $v08, $v08
     vsub  $v14, $v14, $v06
@@ -109,6 +119,22 @@ loop:
     vsubc $v10, $v11, $v09       /* VCOL = S > escm ⇒ escaped */
     vsub  $v10, $v00, $v00       /* fold → 0xFFFF escaped lanes */
     vnor  $v12, $v10, $v10       /* live mask */
+
+    /* K: per-chunk early-out. Pure scalar ops here — vector VCIN chain
+       untouched, so still bit-exact. v12==0 ⇒ all lanes frozen: new z
+       would equal frozen z, cnt add would be +0, S final. Safe to break. */
+    sqv  $v12, 0x00, s7
+    nop
+    nop
+    lw   t3, 0x00(s7)
+    lw   t6, 0x04(s7)
+    or   t3, t3, t6
+    lw   t6, 0x08(s7)
+    or   t3, t3, t6
+    lw   t6, 0x0C(s7)
+    or   t3, t3, t6
+    beqz t3, loopend
+    nop
 
     vsub  $v08, $v06, $v07       /* D = zr²−zi² q8 */
     vadd  $v08, $v08, $v08
@@ -136,7 +162,7 @@ loop:
     addiu t1, t1, -1
     bnez  t1, loop
     nop
-
+loopend:
     sqv  $v13, 0x00, s0          /* out chunk */
     sqv  $v09, 0x00, s2          /* sout chunk (S frozen-exact) */
     addiu s0, 0x10

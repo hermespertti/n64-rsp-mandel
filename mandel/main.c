@@ -391,6 +391,8 @@ int main(void)
 
         int rowmax = H, mirror = 0;
         int mismatch = 0, maxc = 0;
+        static int mm_y[4], mm_x[4], mm_v[4], mm_r[4];
+        for (int i = 0; i < 4; i++) { mm_y[i] = -1; mm_x[i] = -1; mm_v[i] = -1; mm_r[i] = -1; }
         g_interior = use_rsp ? 120 : iters;   /* ucode saturates at NITER=120 */
 
 #if USE_RSP
@@ -432,8 +434,14 @@ int main(void)
                     int v = rows_cnt[y][x];
                     if (v > maxc) maxc = v;
 #if VERIFY
-                    if (v != mandel_q12((int)(int16_t)cxq[x], (int)(int16_t)cyq[y]))
+                    if (v != mandel_q12((int)(int16_t)cxq[x], (int)(int16_t)cyq[y])) {
+                        if (mismatch < 4) {
+                            mm_y[mismatch] = y; mm_x[mismatch] = x;
+                            mm_v[mismatch]  = v;
+                            mm_r[mismatch]  = mandel_q12((int)(int16_t)cxq[x], (int)(int16_t)cyq[y]);
+                        }
                         mismatch++;
+                    }
 #endif
                 }
         }
@@ -508,11 +516,13 @@ int main(void)
         ) {
             char line[256];
             int n = snprintf(line, sizeof(line),
-                "[probe] f=%ld cx=%.9f cy=%.9f span=%.8f path=%s mism=%d max=%d it=%d rsp_ms=%lld btn=%04X conn=%d fly=%d name=%s\n",
+                "[probe] f=%ld cx=%.9f cy=%.9f span=%.8f path=%s mism=%d max=%d it=%d rsp_ms=%lld btn=%04X conn=%d fly=%d name=%s mm0=%d/%d/%d/%d mm1=%d/%d/%d/%d\n",
                 (long)frame, cx0, cy0, span, use_rsp ? "rsp" : "cpu",
                 mismatch, maxc, iters,
                 (long long)(us_rsp / 1000), jin.btn.raw,
-                (int)joypad_is_connected(JOYPAD_PORT_1), fly_active, view_name);
+                (int)joypad_is_connected(JOYPAD_PORT_1), fly_active, view_name,
+                mm_y[0], mm_x[0], mm_v[0], mm_r[0],
+                mm_y[1], mm_x[1], mm_v[1], mm_r[1]);
             static uint8_t isvbuf[256] __attribute__((aligned(8)));
             for (int i = 0; i < n; i++) isvbuf[i] = (uint8_t)line[i];
             for (int i = 0; i < n; i += 4) {
