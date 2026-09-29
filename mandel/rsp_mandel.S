@@ -11,10 +11,11 @@
  *   vmudm = signed·unsigned, NO shift, result bits[31:16] = exact >>16.
  *   (vmulq = b32-17 + round; ares adds &~15 — avoid.)
  *
- * Fixed point: z in q11 (2.0 = 4096). vmudm(zr²)→q6, escape S=q6 ≥ 256.
+ * Fixed point: z in q12 (s16 range ±8 covers z overshoot to 6.5).
+ * vmudm(zr²)→q8, escape S=q8 ≥ 1024 (|z| ≥ 2). Deep zoom beyond span
+ * ~0.08 needs 32-bit accumulator chaining (roadmap).
  * Cross term by identity 2·zr·zi = (zr+zi)² − zr² − zi² so every vmudm
- * operand is non-negative (vt is u16!) — |values| bounded by live-lane
- * radius 2 ⇒ no clamps anywhere (re' ≤ 12K q11, im' ≤ 10.5K q11).
+ * operand is non-negative (vt is u16!).
  * Escape test BEFORE update; escaped lanes FREEZE (old z, cnt stops).
  *
  * VCO discipline (ares interpreter-vpu.cpp verified):
@@ -41,7 +42,7 @@
     .set noreorder
     .set at
 
-    .equ NITER, 60
+    .equ NITER, 120
 
     .data
     .align 8
@@ -122,22 +123,20 @@ loop:
     sqv   $v09, 0xD0, s1
 no_zprobe:
 
-    /* ---- re' = (zr²−zi²)<<5 + cr   (q6 → q11) ---- */
-    vsub  $v08, $v06, $v07         /* D q6 */
+    /* ---- re' = (zr²−zi²)<<4 + cr   (q8 → q12) ---- */
+    vsub  $v08, $v06, $v07         /* D q8 */
     vadd  $v08, $v08, $v08
     vadd  $v08, $v08, $v08
     vadd  $v08, $v08, $v08
     vadd  $v08, $v08, $v08
-    vadd  $v08, $v08, $v08
-    vadd  $v08, $v08, $v02         /* re' q11 */
+    vadd  $v08, $v08, $v02         /* re' q12 */
 
-    /* ---- im' = cross<<5 + ci ---- */
+    /* ---- im' = cross<<4 + ci ---- */
     vadd  $v14, $v14, $v14
     vadd  $v14, $v14, $v14
     vadd  $v14, $v14, $v14
     vadd  $v14, $v14, $v14
-    vadd  $v14, $v14, $v14
-    vadd  $v14, $v14, $v03         /* im' q11 */
+    vadd  $v14, $v14, $v03         /* im' q12 */
 
     /* ---- freeze escaped lanes (keep old z) ---- */
     vand  $v06, $v08, $v12

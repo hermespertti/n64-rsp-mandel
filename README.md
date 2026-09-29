@@ -9,6 +9,12 @@ emulator's headless test runner.
 
 *(320×240 captured from ares, upscaled 2×; smooth-cycle rainbow palette)*
 
+![zoom tour into seahorse valley](mandel/docs_shots/zoom_tour.gif)
+
+*(36 keyframe captures from the headless runner, 320×240 upscaled — home view →
+seahorse valley dive → elephant valley wing → pull back; smooth palette, `mism=0`
+verified at every sampled frame)*
+
 ## What's here
 
 | Path | What |
@@ -22,23 +28,28 @@ emulator's headless test runner.
 ## The ucode
 
 RSP vectors are 128 bits = **8 lanes of signed 16-bit halfwords**, so the fractal
-runs 8 pixels at a time in q11 fixed point (1.0 = 2048):
+runs 8 pixels at a time in q12 fixed point (1.0 = 4096; ±8 range covers escape
+overshoot):
 
 ```
-per iteration (8 pixels in parallel):
-  zr² , zi²        = vmudm(|z|, |z|)        # exact (a·b)>>16, q11² → q6
-  S                = zr² + zi²               # |z|² · 64
-  escape?          = S >= 256               # |z| >= 2, tested BEFORE update
+per iteration (8 pixels in parallel, 120 iters):
+  zr² , zi²        = vmudm(|z|, |z|)        # exact (a·b)>>16, q12² → q8
+  S                = zr² + zi²               # |z|² · 256
+  escape?          = S >= 1024              # |z| >= 2, tested BEFORE update
   2·zr·zi          = (zr+zi)² − zr² − zi²  # keeps every vmudm operand ≥ 0
-  z'               = (S_re << 5) + c        # q6 → q11 back-shift
+  z'               = (D << 4) + c           # q8 → q12 back-shift
   escaped lanes FREEZE (mask via VCO borrow chain), counter stops
 ```
 
 Optimizations in use:
-- **real-axis mirroring** — the set is symmetric, only `ci ≥ 0` rows are computed
-  (121 of 240), each painted twice
+- **real-axis mirroring** while the view straddles the axis symmetrically — only the
+  `ci ≥ 0` rows are computed, each painted twice (auto-off in off-axis zoom views)
 - **smooth coloring** — the ucode also emits the exact escape radius `S`; the CPU maps
   it through a 32 K-entry `log₂log` LUT → continuous palette coordinate, no per-pixel logs
+- **zoom tour** — keyframe animation (seahorse valley, elephant valley wing) with
+  geometric span interpolation = constant octave-rate zoom; view coordinates packed on
+  the CPU in double precision, so the stage is exact at any depth (iteration depth
+  cap ≈ span 0.02 at q12; deeper needs `vmad` 32-bit accumulator chaining — roadmap)
 - precomputed coordinate/palette LUTs, escape-freeze lane masking, single DMA readback
 
 ## Validation
