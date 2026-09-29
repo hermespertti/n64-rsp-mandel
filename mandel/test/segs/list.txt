@@ -1,0 +1,4 @@
+file '/home/lex/n64/mandel/test/segs/s1.mp4'
+file '/home/lex/n64/mandel/test/segs/s2.mp4'
+file '/home/lex/n64/mandel/test/segs/s3.mp4'
+file '/home/lex/n64/mandel/test/segs/s4.mp4'
