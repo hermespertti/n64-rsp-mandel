@@ -10,7 +10,8 @@ all: $(ROMNAME).z64
 include $(N64_INST)/include/n64.mk
 
 C_FILES := main.c
-OBJS := $(addprefix $(BUILD_DIR)/,$(C_FILES:.c=.o))
+ASM_FILES := rsp_mandel.S
+OBJS := $(addprefix $(BUILD_DIR)/,$(C_FILES:.c=.o)) $(addprefix $(BUILD_DIR)/,$(ASM_FILES:.S=.o))
 
 $(BUILD_DIR)/$(ROMNAME).elf: $(OBJS)
 

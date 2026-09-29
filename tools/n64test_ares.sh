@@ -10,7 +10,7 @@ OUT="shots/$(basename "${ROM%.z64}")_ares"
 mkdir -p "$OUT"
 
 xvfb-run -a -n 99 -s "-screen 0 800x600x24" \
-  ares --setting Developer/HomebrewMode=True --no-file-prompt \
+  ares --setting Developer/HomebrewMode=True --setting Input/Defocus=Allow --no-file-prompt \
   "$ROM" > "$OUT/ares.log" 2>&1 &
 APID=$!
 sleep "$SECS"

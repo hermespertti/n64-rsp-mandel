@@ -1,3 +1,6 @@
-build/
-shots/
+docs/ares/
+docs/ares64/
+mandel/build/
 *.o
+.cache/
+*.log
