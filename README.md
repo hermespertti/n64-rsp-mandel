@@ -11,6 +11,8 @@ emulator's headless test runner.
 
 ![zoom tour into seahorse valley](mandel/docs_shots/zoom_tour.gif)
 
+**▶ [Full-quality 30 fps MP4 version (45 s)](mandel/docs_shots/zoom_tour.mp4)**
+
 *(headless-runner captures — home view → seahorse valley dive → **deep tail view at
 span 5×10⁻⁵, ~50,000× magnification** (CPU double pipeline) → elephant valley wing →
 pull back; smooth palette, RSP frames `mism=0`, deep frame 99.67% numpy-agreement)*
