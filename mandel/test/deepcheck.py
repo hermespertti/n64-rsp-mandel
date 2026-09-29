@@ -14,7 +14,7 @@ ys = y0 + SPAN * np.arange(H) / H
 C = xs[None, :] + 1j * ys[:, None]
 
 Z = np.zeros_like(C)
-N = np.zeros(C.shape, dtype=np.int32)
+N = np.full(C.shape, ITERS, dtype=np.int32)   # interior stays at ITERS
 alive = np.ones(C.shape, dtype=bool)
 for i in range(ITERS):
     if not alive.any():
@@ -22,7 +22,7 @@ for i in range(ITERS):
     Z[alive] = Z[alive] * Z[alive] + C[alive]
     esc = (Z.real*Z.real + Z.imag*Z.imag) >= 4.0
     newly = alive & esc
-    N[newly] = i + 1
+    N[newly] = i
     alive &= ~esc
 
 navy_ref = float((N == ITERS).mean())
