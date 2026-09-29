@@ -23,9 +23,11 @@
  * Mask: vsubc escm,S → VCOL=(S>escm); vsub $0,$0 folds → 0xFFFF escaped;
  * vnor → live mask.
  *
- * DMEM map (CPU uploads stage bytes 0x0000..0x0D70 via rsp_load_data):
+ /* DMEM map (CPU uploads stage bytes 0x0000..0x0E60 via rsp_load_data):
  *   0x0000  c_r q11 (320 halfwords)   0x0400  c_i q11
  *   0x0800  out   iters (ucode writes)
+ *   0x0A80  sout  escape S q6 (ucode writes; = |z|²·64 at escape; frozen
+ *            lanes keep S(z_esc) so a post-loop sqv of S is exact)
  *   0x0C00  nchunks u32 (=40)
  *   0x0C40  esc=256   0x0C50 one=1   0x0C60 escm=255  (per-lane vectors)
  *   0x0C80  probe 224 B: +0 nc | +16 esc | +32 one | +48 cr0 | +64 ci0 |
@@ -48,7 +50,7 @@ _dummy: .word 0
     .text
     .globl _start
 _start:
-    li   t7, 0x0C00
+    li   t7, 0x0D00
     lw   t2, 0x00(t7)              /* nchunks */
     slti t4, t2, 0
     bnez t4, nc_neg
@@ -63,19 +65,20 @@ _start:
 nc_neg:
     li   t2, 0
 nc_ok:
-    li   s1, 0x0C80
+    li   s1, 0x0D80
     sw   t2, 0x00(s1)              /* probe nc */
 
     vxor $v00, $v00, $v00          /* zero vector */
     vsubc $v10, $v00, $v00         /* force VCOL = 0 deterministically */
     vsub  $v10, $v00, $v00
 
-    lqv  $v15, 0x50, t7            /* one vector @0x0C50 = 1 per lane */
-    lqv  $v11, 0x60, t7            /* escm vector @0x0C60 = 255 */
+    lqv  $v15, 0x50, t7            /* one vector @0x0D50 = 1 per lane */
+    lqv  $v11, 0x60, t7            /* escm vector @0x0D60 = 255 */
 
     li   t8, 0x0000                /* c_r cursor */
     li   t9, 0x0400                /* c_i cursor */
     li   s0, 0x0800                /* out cursor */
+    li   s2, 0x0A80                /* sout cursor (escape S q6) */
 
 chunk:
     lqv  $v02, 0x00, t8            /* c_r 8 lanes q11 */
@@ -154,10 +157,12 @@ no_zprobe:
     nop
 
     sqv  $v13, 0x00, s0            /* out 8 lanes */
+    sqv  $v09, 0x00, s2            /* sout: S q6 at escape (frozen-exact) */
 
     addiu t8, 0x10
     addiu t9, 0x10
     addiu s0, 0x10
+    addiu s2, 0x10
     addiu t2, -1
     bnez  t2, chunk
     nop
