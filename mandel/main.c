@@ -448,20 +448,38 @@ int main(void)
 #endif /* USE_RSP */
 
         if (!use_rsp) {
-            /* deep view: CPU double pipeline, full coordinate precision */
+            /* deep view: CPU double pipeline, full coordinate precision.
+             * L1: exact main-cardioid + period-2-bulb interior tests skip the
+             * full-iteration worst case for interior pixels. */
             for (int y = 0; y < H; y++) {
                 double ci = y0 + dy * y;
+                double ci2 = ci * ci;
+                double bp1 = (ci + 1.0) * (ci + 1.0);   /* reserved for symmetry views */
+                (void)bp1;
                 for (int x = 0; x < W; x++) {
                     double cr = x0 + dx * x;
                     double zr = 0, zi = 0, S = 0;
                     int cnt = iters;
-                    for (int i = 0; i < iters; i++) {
-                        double r2 = zr * zr, i2 = zi * zi;
-                        S = r2 + i2;
-                        if (S >= 4.0) { cnt = i; break; }
-                        double t = r2 - i2;
-                        zi = 2.0 * zr * zi + ci;
-                        zr = t + cr;
+#if !defined(NO_L1)
+                    double crm = cr - 0.25;
+                    double q = crm * crm + ci2;
+                    if (q * (q + crm) < 0.25 * ci2) {
+                        cnt = iters; S = q;             /* main cardioid interior */
+                    } else if ((cr + 1.0) * (cr + 1.0) + ci2 < 0.0625) {
+                        cnt = iters; S = 0.0;           /* period-2 bulb interior */
+                    } else
+#else
+                    if (0) { } else
+#endif
+                    {
+                        for (int i = 0; i < iters; i++) {
+                            double r2 = zr * zr, i2 = zi * zi;
+                            S = r2 + i2;
+                            if (S >= 4.0) { cnt = i; break; }
+                            double t = r2 - i2;
+                            zi = 2.0 * zr * zi + ci;
+                            zr = t + cr;
+                        }
                     }
                     rows_cnt[y][x] = (uint16_t)cnt;
                     if (cnt > maxc) maxc = cnt;

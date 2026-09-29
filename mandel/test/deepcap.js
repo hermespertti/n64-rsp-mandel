@@ -6,8 +6,12 @@ ares.loadRom(ares.args[0]);
 ares.resume();
 
 const N = parseInt(ares.args[1] || "3", 10);
+// Deep CPU frames exceed any sane VI-wait; gate on the ROM's own probe line.
+// First shot after TWO probes (probe N+1 means frame N has flipped to VI);
+// after that one probe per frame is safe.
 for (let i = 0; i < N; i++) {
-  ares.wait(i === 0 ? 5 : 40);
+  ares.waitLog("[probe]", { timeout: 600000 });
+  if (i === 0) ares.waitLog("[probe]", { timeout: 600000 });
   const shot = ares.screenshot();
   shot.save("test/deep/g" + i + ".png");
   console.log("captured deep frame " + i);

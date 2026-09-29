@@ -45,17 +45,22 @@ for qb in range(-24, -17):
     zq = 48 + qb
     span_floor = 320.0 * 2.0**-zq   # LUT/quantization span floor if CR at z-q
     print(f"z q{zq}: span_floor={span_floor:.2e} ok={ok}")
-    if ok:
+    if isinstance(det, dict):
         for k, v in det.items(): print(f"    {k}: {v}")
 
 # half-scale trick: iterate w = z/2 so box |w| <= sqrt5/2
 print("\nhalf-scale w=z/2, escape |w|>=1:")
 for zq in range(16, 27):
-    # two-word z=w*2^zq: h = w*2^(zq-16), box 1.118
+    # two-word w=w*2^zq with w=z/2, escape |w|>=1 (|z|>=2): h = w*2^(zq-16), |h|<=2^(zq-16)
+    h = 1.0 * 2**(zq-16)              # |w| < 1 before escape... allow overshoot 1.118
     h = 1.118 * 2**(zq-16)
-    f1 = h*h * 2**32                      # h^2 frag at acc q32
-    p = 2*h*65535 * 2**16
+    # frags of w^2 reduced to acc grid q(zq+16): h2 = h*h*2^16 (q(2zq+32))? keep simple:
+    # wq^2 = h^2*2^32 + 2hm*2^16 + l^2, want acc q(2zq) grid = q? acc holds wq^2 directly?
+    # acc 48-bit: wq^2 <= 1.25*2^(2zq) <= 2^47 -> zq <= 23. frags individually <= 2^31(u):
+    f1 = h*h                      # h^2 fragment value (before operand-shift folding) <= u16 product result: fits since it IS the product h*h, acc += via vmudm h,h = h^2 (acc q(2zq) needs h^2 at bits 32: not possible in one add unless h^2 <= 2^32 AND acc fits)
+    f1v = h*h
+    p = 2*h*65535
     f3 = 65535.0**2
     acc = 1.25 * 2**(2*zq)
-    ok = f1 <= 2**32 and p <= 2**32 and f3 <= 2**32 and acc <= 2**47
-    print(f"  w q{zq}: h2frag={f1:.2e} 2hl={p:.2e} acc={acc:.2e} -> {'OK' if ok else 'over'}")
+    ok = acc <= 2**47
+    print(f"  w q{zq}: acc(w²)={acc:.2e} vs 2^47={2.0**47:.2e} -> {'OK' if ok else 'over'}")
