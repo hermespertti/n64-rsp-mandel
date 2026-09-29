@@ -603,6 +603,7 @@ int main(void)
 #endif /* USE_RSP */
 
         int morphed = 0;
+#ifndef RING_OFF
         if (!use_rsp) {
             /* deep zone: prefer ring morph (fast) over CPU render (slow) */
             int ia, ib;
@@ -611,6 +612,7 @@ int main(void)
                 morphed = 1;
             }
         }
+#endif
         if (!use_rsp && !morphed) {
             /* deep view: CPU double pipeline, full coordinate precision.
              * L1: exact main-cardioid + period-2-bulb interior tests skip the
