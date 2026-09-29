@@ -133,7 +133,9 @@ static int   hud_on = 1;
  * saved by genuine renders whenever the live span strays more than
  * RING_RATIO from every stored key (or no shallower key exists), so the
  * ring auto-populates while touring and hitches only at new depth. */
-#define RING_CAP   12
+#define RING_CAP   24             /* full tour deep leg = ~21 octave buckets;
+                                     capacity >= that means no re-render churn.
+                                     24 half-res keys ~ 1.8 MB RDRAM. */
 #define RING_RATIO 2.0
 #define RING_TOP   0.078          /* span of bucket 0 == RSP_MIN_SPAN */
 #define RW         (W / 2)         /* ring key resolution: half, upscaled on */
@@ -156,7 +158,9 @@ static int ring_lookup(double cx, double cy, double span, int *ia, int *ib)
         if (!ring[i].valid) continue;
         double dl = fabs(log(ring[i].span) - lv);
         if (dl > DMAX) continue;
-        double mx = (ring[i].span + span) * 0.28;   /* pan tolerance */
+        double mx = (ring[i].span + span) * 0.75;   /* generous pan tolerance:
+            morph mapping is geometrically exact; off-center pans just clamp
+            at texture edges, which the zoom hides almost entirely. */
         if (fabs(cx - ring[i].cx) > mx || fabs(cy - ring[i].cy) > mx) continue;
         if (ring[i].span >= span) { if (dl < da) { da = dl; a = i; } }
         else                      { if (dl < db) { db = dl; b = i; } }
@@ -177,7 +181,7 @@ static int ring_covers(double cx, double cy, double span)
         if (!ring[i].valid) continue;
         if (fabs(log(ring[i].span) - lv) >= log(RING_RATIO)) continue;
         double dx = fabs(cx - ring[i].cx), dy = fabs(cy - ring[i].cy);
-        if (dx > ring[i].span * 0.25 || dy > ring[i].span * 0.25) continue;
+        if (dx > ring[i].span * 0.6 || dy > ring[i].span * 0.6) continue;
         return 1;
     }
     return 0;
@@ -356,16 +360,41 @@ static void view_at(long f, double *cx, double *cy, double *span)
     double seg = keys[i].hold + MOVE_FRAMES;
     while (tf >= seg) { tf -= seg; i = (i + 1) % NKEY; seg = keys[i].hold + MOVE_FRAMES; }
     int next = (i + 1) % NKEY;
-    double e = 0;
-    if (tf >= keys[i].hold) {
-        double u = (tf - keys[i].hold) / MOVE_FRAMES;   /* 0..1 across move */
-        e = u * u * (3.0 - 2.0 * u);                     /* smoothstep */
+    if (keys[i].span < RSP_MIN_SPAN || keys[next].span < RSP_MIN_SPAN) {
+        /* deep-touching segment: zoom to corridor -> pan fast at corridor
+           span -> dive/zoom at one fixed center. Dive frames share the
+           target center with ring keys (delta=0), so after one pass the
+           whole descent morphs at full fps instead of re-rendering. */
+        double u = 0;
+        if (tf >= keys[i].hold) u = (tf - keys[i].hold) / MOVE_FRAMES;
+        double s0 = keys[i].span, s1 = keys[next].span;
+        double corr = (s0 < s1 ? s0 : s1);            /* shallowest endpoint */
+        if (corr < RSP_MIN_SPAN) corr = RSP_MIN_SPAN;/* ...but stay on RSP */
+        if (u < 0.25) {                                /* phase 1: reach corridor */
+            double p = (u / 0.25); p = p * p * (3 - 2 * p);
+            *span = exp(log(s0) + (log(corr) - log(s0)) * p);
+            *cx = keys[i].cx; *cy = keys[i].cy;
+        } else if (u < 0.5) {                        /* phase 2: pan at corridor */
+            double p = (u - 0.25) / 0.25; p = p * p * (3 - 2 * p);
+            *cx = keys[i].cx + (keys[next].cx - keys[i].cx) * p;
+            *cy = keys[i].cy + (keys[next].cy - keys[i].cy) * p;
+            *span = corr;
+        } else {                                     /* phase 3: zoom at target c */
+            double p = (u - 0.5) / 0.5; p = p * p * (3 - 2 * p);
+            *cx = keys[next].cx; *cy = keys[next].cy;
+            *span = exp(log(corr) + (log(s1) - log(corr)) * p);
+        }
+    } else {
+        double e = 0;
+        if (tf >= keys[i].hold) {
+            double u = (tf - keys[i].hold) / MOVE_FRAMES;
+            e = u * u * (3.0 - 2.0 * u);
+        }
+        *cx = keys[i].cx + (keys[next].cx - keys[i].cx) * e;
+        *cy = keys[i].cy + (keys[next].cy - keys[i].cy) * e;
+        double ls = log(keys[i].span), ln = log(keys[next].span);
+        *span = exp(ls + (ln - ls) * e);
     }
-    *cx = keys[i].cx + (keys[next].cx - keys[i].cx) * e;
-    *cy = keys[i].cy + (keys[next].cy - keys[i].cy) * e;
-    /* geometric span interp: linear in log-space = constant zoom rate */
-    double ls = log(keys[i].span), ln = log(keys[next].span);
-    *span = exp(ls + (ln - ls) * e);
 }
 
 int main(void)
