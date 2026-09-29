@@ -115,6 +115,17 @@ On official Ares: `ares --setting Developer/HomebrewMode=True mandel.z64`
   the accumulator* — easy to misread as the `vd` result. Every accurate emulator
   reproduces the hardware; the guide is the trap.
 
+## Performance notes
+
+- Stage-K per-chunk early-out: each 8-px chunk tests its live mask after every
+  iteration (scalar `lw`+`or` over the vector mask in DMEM scratch); when all 8 lanes
+  escape, the chunk breaks immediately — bit-exact because escaped lanes are frozen.
+  Home view interpreter timing drops 892 µs → 338 µs (~2.6×). Interior chunks still
+  pay full NITER; that's the nature of escape-time rendering.
+- The MP4 tour is motion-interpolated (`minterpolate`) from sparse captures — the deep
+  CPU-double leg is seconds/frame on real hardware; the RSP leg (span ≥ 0.078) is
+  interactive.
+
 ## License
 
 Same terms as libdragon samples (public-domain-ish); the ucode and CPU code here are
