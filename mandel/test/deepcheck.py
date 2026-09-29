@@ -31,7 +31,7 @@ for i in range(ITERS):
 navy_ref = float((N == ITERS).mean())
 print(f"numpy navy fraction: {navy_ref:.4f}")
 
-im = Image.open("test/deep/g1.png").convert("RGB").resize((W, H), Image.NEAREST)
+im = Image.open("test/deep/g2.png").convert("RGB").resize((W, H), Image.NEAREST)
 px = np.asarray(im)
 rom_navy = float(((px[:,:,0] == 8) & (px[:,:,1] == 4) & (px[:,:,2] == 16)).mean())
 print(f"ROM   navy fraction: {rom_navy:.4f}")

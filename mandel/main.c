@@ -527,6 +527,10 @@ int main(void)
             hud_text(pix, 4, 11, l2, cteal, cblack);
         }
 
+        display_show(fb);
+
+        /* probe AFTER flip: probe-gated screenshots (deepcap) then always see
+           the frame they describe — pre-flip gating captured black buffers. */
         if ((frame % 60) == 0
 #ifdef AUTOTEST
             || 1
@@ -552,7 +556,6 @@ int main(void)
             us_rsp = us_pack = us_paint = 0;
         }
 
-        display_show(fb);
         frame++;
     }
 }

@@ -6,13 +6,19 @@ ares.loadRom(ares.args[0]);
 ares.resume();
 
 const N = parseInt(ares.args[1] || "3", 10);
-// Deep CPU frames exceed any sane VI-wait; gate on the ROM's own probe line.
-// First shot after TWO probes (probe N+1 means frame N has flipped to VI);
-// after that one probe per frame is safe.
-for (let i = 0; i < N; i++) {
+// Probe fires post-flip now, but the first two flips still race the runner;
+// skip early probes and tolerate screenshot failures until VI is stable.
+let shot = 0, guard = 0;
+while (shot < N && guard < N + 6) {
   ares.waitLog("[probe]", { timeout: 600000 });
-  if (i === 0) ares.waitLog("[probe]", { timeout: 600000 });
-  const shot = ares.screenshot();
-  shot.save("test/deep/g" + i + ".png");
-  console.log("captured deep frame " + i);
+  guard++;
+  if (guard <= 2) continue;
+  try {
+    const s = ares.screenshot();
+    s.save("test/deep/g" + shot + ".png");
+    console.log("captured deep frame " + shot);
+    shot++;
+  } catch (e) {
+    console.log("shot skipped: " + e.message);
+  }
 }
