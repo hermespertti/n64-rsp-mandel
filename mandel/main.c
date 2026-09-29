@@ -119,7 +119,7 @@ static const Key keys[] = {
 #define START_FRAME 0
 #endif
 
-static double view_x0 = -2.0, view_x1 = 0.6;   /* home view (verify ref) */
+/* (home-view bounds kept only for legacy verify refs; deep path recomputes) */
 
 static uint16_t cxq[W];                  /* q12 c_x for current view */
 static uint16_t cyq[H];                  /* q12 c_y per row */
@@ -200,6 +200,7 @@ int main(void)
     debug_init_emulog();   /* rdpq stays OFF (it would own the RSP) */
     display_init(RESOLUTION_320x240, DEPTH_32_BPP, 2, GAMMA_NONE, FILTERS_DISABLED);
     timer_init();
+    joypad_init();
 
     build_palette();
     build_smooth_tab();
@@ -220,6 +221,11 @@ int main(void)
     long frame = START_FRAME;
     long long us_rsp = 0, us_pack = 0, us_paint = 0;
 
+    /* interactive view state (stage H): auto=1 → zoom tour, auto=0 → pad */
+    int auto_mode = 1;
+    double vcx = keys[0].cx, vcy = keys[0].cy, vspan = keys[0].span;
+    int pad_active = 0, pad_inactive_frames = 0;
+
     printf("[n64] mandel stage-E boot: %dx%d zoom tour NKEY=%d verify=%d\n",
            W, H, NKEY, VERIFY);
 
@@ -227,8 +233,43 @@ int main(void)
         surface_t *fb = display_get();
         uint32_t *pix = (uint32_t *)fb->buffer;
 
+        /* ---- stage H: controller input ---- */
+        joypad_inputs_t jin = joypad_get_inputs(JOYPAD_PORT_1);
+        int sx = jin.stick_x, sy = jin.stick_y;
+        if (sx > -7 && sx < 7) sx = 0;            /* stick deadzone */
+        if (sy > -7 && sy < 7) sy = 0;
+        int bx = (int)jin.btn.d_right - (int)jin.btn.d_left;
+        int by = (int)jin.btn.d_down - (int)jin.btn.d_up;
+        int any_btn = jin.btn.a || jin.btn.b || jin.btn.z || jin.btn.l ||
+                      jin.btn.r || jin.btn.start;
+        if (sx || sy || bx || by || any_btn) pad_inactive_frames = 0;
+        else if (pad_active) pad_inactive_frames++;
+        if (jin.btn.start) { auto_mode = 1; pad_active = 0; }   /* resume tour */
+        if ((sx || sy || bx || by || jin.btn.z || jin.btn.a || jin.btn.b ||
+             jin.btn.l || jin.btn.r) && !jin.btn.start) {
+            auto_mode = 0;
+            pad_active = 1;
+        }
+        if (pad_active && pad_inactive_frames > 300) { auto_mode = 1; pad_active = 0; }
+
         double cx0, cy0, span;
-        view_at(frame, &cx0, &cy0, &span);
+        if (auto_mode) {
+            view_at(frame, &cx0, &cy0, &span);
+            vcx = cx0; vcy = cy0; vspan = span;
+        } else {
+            double zoomf = 1.0;
+            if (jin.btn.z || jin.btn.r) zoomf = 0.94;          /* zoom in */
+            if (jin.btn.l) zoomf = 1.06;                        /* zoom out */
+            double pan_scale = vspan / 900.0;
+            double mx = (sx ? (double)sx : (double)bx * 60.0);
+            double my = (sy ? -(double)sy : (double)by * 60.0); /* stick up = -imag */
+            vcx += mx * pan_scale;
+            vcy += my * pan_scale;
+            vspan *= zoomf;
+            if (vspan < 5e-5) vspan = 5e-5;
+            if (vspan > 4.0)  vspan = 4.0;
+            cx0 = vcx; cy0 = vcy; span = vspan;
+        }
         double dx = span / W, dy = span / H;
         double x0 = cx0 - span / 2, y0 = cy0 - span / 2;
 
