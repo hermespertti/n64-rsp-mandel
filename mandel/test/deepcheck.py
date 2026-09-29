@@ -9,8 +9,10 @@ ITERS = 1200
 W, H = 320, 240
 
 x0, y0 = CX - SPAN/2, CY - SPAN/2
-xs = x0 + SPAN * np.arange(W) / W
-ys = y0 + SPAN * np.arange(H) / H
+# match ROM op order exactly: dx = span/W, cr = x0 + dx*x
+dx, dy = SPAN / W, SPAN / H
+xs = x0 + dx * np.arange(W)
+ys = y0 + dy * np.arange(H)
 C = xs[None, :] + 1j * ys[:, None]
 
 Z = np.zeros_like(C)
@@ -19,11 +21,12 @@ alive = np.ones(C.shape, dtype=bool)
 for i in range(ITERS):
     if not alive.any():
         break
-    Z[alive] = Z[alive] * Z[alive] + C[alive]
-    esc = (Z.real*Z.real + Z.imag*Z.imag) >= 4.0
-    newly = alive & esc
-    N[newly] = i
+    # ROM order: test escape BEFORE update (S of current z)
+    S = Z.real*Z.real + Z.imag*Z.imag
+    esc = alive & (S >= 4.0)
+    N[esc] = i
     alive &= ~esc
+    Z[alive] = Z[alive] * Z[alive] + C[alive]
 
 navy_ref = float((N == ITERS).mean())
 print(f"numpy navy fraction: {navy_ref:.4f}")

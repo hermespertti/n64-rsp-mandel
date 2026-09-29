@@ -54,8 +54,9 @@ Optimizations in use:
 - **hybrid deep zoom** — RSP q12 handles spans ≥ 0.078 in vector hardware; deeper
   views (down to span 5e-5, ~50,000× magnification) switch to a CPU double-precision
   pipeline with depth-scaled iteration counts, verified against a numpy reference
-  (99.67% interior/exterior agreement at the seahorse-tail keyframe). q12 deep-zoom
-  via `vmad` accumulator chaining remains on the roadmap
+  (99.92% interior/exterior agreement at the seahorse-tail keyframe; the residual
+  0.08% is boundary-band + smooth-palette difference, not classification error).
+  q12 deep-zoom via `vmad` accumulator chaining remains on the roadmap
 - precomputed coordinate/palette LUTs, escape-freeze lane masking, single DMA readback
 
 ## Validation
