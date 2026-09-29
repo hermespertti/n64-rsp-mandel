@@ -124,7 +124,133 @@ static const Key keys[] = {
 /* ---- stage J: HUD + preset fly-to ---- */
 #include "font8x8_min.h"
 
-static int hud_on = 1;
+static int   hud_on = 1;
+
+/* ---- stage L2: keyframe ring (fluid deep playback) ----
+ * CPU deep zone (span < RSP_MIN_SPAN) renders at seconds/frame. Live deep
+ * views instead AFFINE-MORPH between two stored keyframes: geometrically
+ * exact mapping, cost ~2 fetches/pixel instead of NITER loops. Keys are
+ * saved by genuine renders whenever the live span strays more than
+ * RING_RATIO from every stored key (or no shallower key exists), so the
+ * ring auto-populates while touring and hitches only at new depth. */
+#define RING_CAP   12
+#define RING_RATIO 2.0
+#define RING_TOP   0.078          /* span of bucket 0 == RSP_MIN_SPAN */
+#define RW         (W / 2)         /* ring key resolution: half, upscaled on */
+#define RH         (H / 2)
+
+typedef struct { double span, cx, cy; int valid; uint32_t px[RW * RH]; } RKey;
+static RKey ring[RING_CAP] = { {0} };
+static int  ring_n = 0;
+
+/* Can the ring represent this view? Bracketing keys within log-span window
+   and pan tolerance; affine map is exact, slight pan shows as edge clamp
+   smear during fast diagonal moves (acceptable, standard zoom-morph look). */
+static int ring_lookup(double cx, double cy, double span, int *ia, int *ib)
+{
+    double lv = log(span);
+    int a = -1, b = -1;
+    double da = 1e30, db = 1e30;
+    const double DMAX = log(RING_RATIO * 2.0);
+    for (int i = 0; i < ring_n; i++) {
+        if (!ring[i].valid) continue;
+        double dl = fabs(log(ring[i].span) - lv);
+        if (dl > DMAX) continue;
+        double mx = (ring[i].span + span) * 0.28;   /* pan tolerance */
+        if (fabs(cx - ring[i].cx) > mx || fabs(cy - ring[i].cy) > mx) continue;
+        if (ring[i].span >= span) { if (dl < da) { da = dl; a = i; } }
+        else                      { if (dl < db) { db = dl; b = i; } }
+    }
+    if (a < 0 && b < 0) return 0;
+    if (a < 0) a = b;
+    if (b < 0) b = a;
+    *ia = a; *ib = b;
+    return 1;
+}
+
+/* Is this view already covered? Bucket scheme: one key per log-span bucket
+   (ratio RING_RATIO) per center region; morph works between adjacent buckets. */
+static int ring_covers(double cx, double cy, double span)
+{
+    double lv = log(span);
+    for (int i = 0; i < ring_n; i++) {
+        if (!ring[i].valid) continue;
+        if (fabs(log(ring[i].span) - lv) >= log(RING_RATIO)) continue;
+        double dx = fabs(cx - ring[i].cx), dy = fabs(cy - ring[i].cy);
+        if (dx > ring[i].span * 0.25 || dy > ring[i].span * 0.25) continue;
+        return 1;
+    }
+    return 0;
+}
+
+static void ring_save(double cx, double cy, double span, const uint32_t *pix)
+{
+    /* bucket = depth-octave below the RSP boundary; 0 = shallowest deep
+       octave, +1 per 2x deeper. One slot per octave, re-entry overwrites. */
+    int bkt = (int)floor(log(RING_TOP / span) / log(2.0));
+    if (bkt < 0) bkt = 0;
+    int slot = bkt % RING_CAP;
+    RKey *k = &ring[slot];
+    k->cx = cx; k->cy = cy; k->span = span;
+    uint32_t *d = k->px;
+    for (int y = 0; y < RH; y++) {
+        const uint32_t *s = pix + (size_t)(y * 2) * W;
+        for (int x = 0; x < RW; x++) d[y * RW + x] = s[x * 2];
+    }
+    k->valid = 1;
+    if (slot + 1 > ring_n) ring_n = slot + 1;
+}
+
+static inline uint32_t blend32(uint32_t c0, uint32_t c1, int t8)
+{
+    int r = ((int)(c0 & 0xFF) * (256 - t8) + (int)(c1 & 0xFF) * t8) >> 8;
+    int g = ((int)((c0 >> 8) & 0xFF) * (256 - t8) + (int)((c1 >> 8) & 0xFF) * t8) >> 8;
+    int b = ((int)((c0 >> 16) & 0xFF) * (256 - t8) + (int)((c1 >> 16) & 0xFF) * t8) >> 8;
+    return (uint32_t)r | ((uint32_t)g << 8) | ((uint32_t)b << 16) | 0xFF000000u;
+}
+
+/* Affine map each output pixel into both keys' textures (integer q16 steps,
+   MIPS-friendly) and blend. Exact geometry: u = (w - key.c)/key.span + 0.5 */
+static void ring_morph(uint32_t *out, double cx, double cy, double span, int ia, int ib)
+{
+    const RKey *ka = &ring[ia], *kb = &ring[ib];
+    double la = log(ka->span), lb = log(kb->span), lv = log(span);
+    double t = (la == lb) ? 0.0 : (lv - la) / (lb - la);
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    int t8 = (int)(t * 256.0);
+    double vy0 = cy - span / 2, vx0 = cx - span / 2;
+    double dx = span / W, dy = span / H;
+    double sa = RW / ka->span, sb = RW / kb->span;
+    /* row-independent column increments (q16 of texel coords) */
+    int dxa = (int)(dx * sa * 65536.0), dxb = (int)(dx * sb * 65536.0);
+    for (int y = 0; y < H; y++) {
+        double wy = vy0 + dy * y;
+        int ya = (int)(((wy - ka->cy) * sa + 0.5) * 65536.0);
+        int yb = (int)(((wy - kb->cy) * sb + 0.5) * 65536.0);
+        int xa = (int)(((vx0 - ka->cx) * sa + 0.5) * 65536.0);
+        int xb = (int)(((vx0 - kb->cx) * sb + 0.5) * 65536.0);
+        uint32_t *o = out + (size_t)y * W;
+        for (int x = 0; x < W; x++) {
+            int sax = xa >> 16, say = ya >> 16;
+            int sbx = xb >> 16, sby = yb >> 16;
+            if (sax < 0) sax = 0;
+            if (sax >= RW) sax = RW - 1;
+            if (say < 0) say = 0;
+            if (say >= RH) say = RH - 1;
+            if (sbx < 0) sbx = 0;
+            if (sbx >= RW) sbx = RW - 1;
+            if (sby < 0) sby = 0;
+            if (sby >= RH) sby = RH - 1;
+            o[x] = blend32(ka->px[say * RW + sax], kb->px[sby * RW + sbx], t8);
+            xa += dxa; xb += dxb;
+        }
+        /* vertical steps: dy/span maps view rows onto texel rows */
+        ya = 0; yb = 0;
+        (void)ya; (void)yb;
+    }
+    (void)dy;
+}
 
 typedef struct { double cx, cy, span; const char *name; } Preset;
 static const Preset presets[] = {
@@ -447,7 +573,16 @@ int main(void)
         }
 #endif /* USE_RSP */
 
+        int morphed = 0;
         if (!use_rsp) {
+            /* deep zone: prefer ring morph (fast) over CPU render (slow) */
+            int ia, ib;
+            if (ring_lookup(cx0, cy0, span, &ia, &ib)) {
+                ring_morph(pix, cx0, cy0, span, ia, ib);
+                morphed = 1;
+            }
+        }
+        if (!use_rsp && !morphed) {
             /* deep view: CPU double pipeline, full coordinate precision.
              * L1: exact main-cardioid + period-2-bulb interior tests skip the
              * full-iteration worst case for interior pixels. */
@@ -490,6 +625,7 @@ int main(void)
         }
 
         long long t1 = timer_ticks();
+        if (!morphed) {
         for (int y = 0; y < rowmax; y++) {
             uint32_t *d = pix + (size_t)y * W;
             uint16_t *cn = rows_cnt[y], *ss = rows_s[y];
@@ -505,6 +641,11 @@ int main(void)
             }
         }
         us_paint += TIMER_MICROS_LL(timer_ticks() - t1);
+
+        /* deep render: harvest a ring key if this view isn't covered yet */
+        if (!use_rsp && !ring_covers(cx0, cy0, span))
+            ring_save(cx0, cy0, span, pix);
+        }
 
         /* ---- HUD ---- */
         if (hud_on) {
@@ -538,13 +679,13 @@ int main(void)
         ) {
             char line[256];
             int n = snprintf(line, sizeof(line),
-                "[probe] f=%ld cx=%.9f cy=%.9f span=%.8f path=%s mism=%d max=%d it=%d rsp_ms=%lld btn=%04X conn=%d fly=%d name=%s mm0=%d/%d/%d/%d mm1=%d/%d/%d/%d\n",
+                "[probe] f=%ld cx=%.9f cy=%.9f span=%.8f path=%s mism=%d max=%d it=%d rsp_ms=%lld btn=%04X conn=%d fly=%d name=%s keys=%d morph=%d mm0=%d/%d/%d/%d\n",
                 (long)frame, cx0, cy0, span, use_rsp ? "rsp" : "cpu",
                 mismatch, maxc, iters,
                 (long long)(us_rsp / 1000), jin.btn.raw,
                 (int)joypad_is_connected(JOYPAD_PORT_1), fly_active, view_name,
-                mm_y[0], mm_x[0], mm_v[0], mm_r[0],
-                mm_y[1], mm_x[1], mm_v[1], mm_r[1]);
+                ring_n, morphed,
+                mm_y[0], mm_x[0], mm_v[0], mm_r[0]);
             static uint8_t isvbuf[256] __attribute__((aligned(8)));
             for (int i = 0; i < n; i++) isvbuf[i] = (uint8_t)line[i];
             for (int i = 0; i < n; i += 4) {
