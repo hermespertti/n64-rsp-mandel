@@ -121,6 +121,53 @@ static const Key keys[] = {
 
 /* (home-view bounds kept only for legacy verify refs; deep path recomputes) */
 
+/* ---- stage J: HUD + preset fly-to ---- */
+#include "font8x8_min.h"
+
+static int hud_on = 1;
+
+typedef struct { double cx, cy, span; const char *name; } Preset;
+static const Preset presets[] = {
+    { -0.700000,          0.000000,         2.6,   "HOME" },
+    { -0.745800,         -0.114900,         0.02,  "SEAHORSE" },
+    { -0.7436438870371,   0.1318259042053, 5e-5,  "TAIL" },
+    { -0.745000,         -0.115000,         0.30,  "VALLEY" },
+};
+#define NPRESET ((int)(sizeof(presets)/sizeof(presets[0])))
+
+static int   fly_active = 0;
+static double f_cx, f_cy, f_span;
+static const char *fly_name = "PRESET";
+#ifdef AUTOTEST
+static int fly_req = -1;
+#endif
+
+static void fmt_span(double s, char *out)
+{
+    if (s >= 0.001) snprintf(out, 16, "%.4f", s);
+    else snprintf(out, 16, "%.1E", s);       /* uppercase E — font lacks e */
+}
+
+static void hud_char(uint32_t *fb, int x, int y, char c, uint32_t fg, uint32_t bg)
+{
+    if (c < FONT_FIRST || c > FONT_LAST) c = '?';
+    const uint8_t *g = font8x8[c - FONT_FIRST];
+    for (int ry = 0; ry < 8; ry++) {
+        uint32_t *d = fb + (size_t)(y + ry) * W + x;
+        uint8_t bm = g[ry];
+        for (int rx = 0; rx < 8; rx++)
+            d[rx] = (bm & (0x80 >> rx)) ? fg : bg;
+    }
+}
+
+static void hud_text(uint32_t *fb, int x, int y, const char *s, uint32_t fg, uint32_t bg)
+{
+    while (*s && x + 8 <= W) {
+        hud_char(fb, x, y, *s++, fg, bg);
+        x += 8;
+    }
+}
+
 static uint16_t cxq[W];                  /* q12 c_x for current view */
 static uint16_t cyq[H];                  /* q12 c_y per row */
 static uint16_t rows_cnt[H][W];         /* ucode escape counts */
@@ -235,28 +282,82 @@ int main(void)
 
         /* ---- stage H: controller input ---- */
         joypad_inputs_t jin = joypad_get_inputs(JOYPAD_PORT_1);
+#ifdef AUTOTEST
+        /* scripted input for headless verification (SI not polled in fork
+           headless JS runner): cycle presets through the same fly path */
+        {
+            static int auto_prev = -1;
+            int slot = (int)((frame / 20) % (NPRESET + 1));
+            if (slot != auto_prev) {
+                auto_prev = slot;
+                fly_req = (slot < NPRESET) ? slot : -2;   /* -2 = Start */
+            }
+        }
+#endif
         int sx = jin.stick_x, sy = jin.stick_y;
         if (sx > -7 && sx < 7) sx = 0;            /* stick deadzone */
         if (sy > -7 && sy < 7) sy = 0;
         int bx = (int)jin.btn.d_right - (int)jin.btn.d_left;
         int by = (int)jin.btn.d_down - (int)jin.btn.d_up;
+#ifdef AUTOTEST
+        if (fly_req >= 0) { int pidx = fly_req; fly_active = 1;
+            f_cx = presets[pidx].cx; f_cy = presets[pidx].cy;
+            f_span = presets[pidx].span; fly_name = presets[pidx].name;
+            auto_mode = 0; pad_active = 1; fly_req = -1; }
+        else if (fly_req == -2) { auto_mode = 1; pad_active = 0; fly_active = 0; fly_req = -1; }
+#endif
         int any_btn = jin.btn.a || jin.btn.b || jin.btn.z || jin.btn.l ||
                       jin.btn.r || jin.btn.start;
         if (sx || sy || bx || by || any_btn) pad_inactive_frames = 0;
         else if (pad_active) pad_inactive_frames++;
-        if (jin.btn.start) { auto_mode = 1; pad_active = 0; }   /* resume tour */
-        if ((sx || sy || bx || by || jin.btn.z || jin.btn.a || jin.btn.b ||
+        if (jin.btn.start) { auto_mode = 1; pad_active = 0; fly_active = 0; }
+        /* C-buttons: fly to presets */
+        {
+            int pidx = -1;
+            if (jin.btn.c_up)    pidx = 0;
+            if (jin.btn.c_right) pidx = 1;
+            if (jin.btn.c_down)  pidx = 2;
+            if (jin.btn.c_left)  pidx = 3;
+            if (pidx >= 0) {
+                fly_active = 1;
+                f_cx = presets[pidx].cx; f_cy = presets[pidx].cy;
+                f_span = presets[pidx].span;
+                fly_name = presets[pidx].name;
+                auto_mode = 0; pad_active = 1;
+            }
+        }
+        if ((sx || sy || bx || by || jin.btn.z ||
              jin.btn.l || jin.btn.r) && !jin.btn.start) {
             auto_mode = 0;
             pad_active = 1;
         }
+        static int prev_b = 0;
+        if (jin.btn.b && !prev_b) hud_on = !hud_on;
+        prev_b = jin.btn.b;
         if (pad_active && pad_inactive_frames > 300) { auto_mode = 1; pad_active = 0; }
 
         double cx0, cy0, span;
+        const char *view_name;
         if (auto_mode) {
             view_at(frame, &cx0, &cy0, &span);
             vcx = cx0; vcy = cy0; vspan = span;
+            view_name = "TOUR";
+        } else if (fly_active) {
+            /* exponential ease toward preset; geometric span glide */
+            double e = 0.06;
+            vcx += (f_cx - vcx) * e;
+            vcy += (f_cy - vcy) * e;
+            double ls = log(vspan), ln = log(f_span);
+            vspan = exp(ls + (ln - ls) * e);
+            if (fabs(vspan - f_span) < f_span * 1e-4 &&
+                fabs(vcx - f_cx) < 1e-9 && fabs(vcy - f_cy) < 1e-9) {
+                vcx = f_cx; vcy = f_cy; vspan = f_span;
+                fly_active = 0;
+            }
+            cx0 = vcx; cy0 = vcy; span = vspan;
+            view_name = fly_name;
         } else {
+            view_name = "MANUAL";
             double zoomf = 1.0;
             if (jin.btn.z || jin.btn.r) zoomf = 0.94;          /* zoom in */
             if (jin.btn.l) zoomf = 1.06;                        /* zoom out */
@@ -379,13 +480,39 @@ int main(void)
         }
         us_paint += TIMER_MICROS_LL(timer_ticks() - t1);
 
-        if ((frame % 60) == 0) {
+        /* ---- HUD ---- */
+        if (hud_on) {
+            char sp[16]; fmt_span(span, sp);
+            char xs[12], ys[12];
+            snprintf(xs, sizeof(xs), "%.6f", cx0);
+            snprintf(ys, sizeof(ys), "%.6f", cy0);
+            char l1[64], l2[64];
+            snprintf(l1, sizeof(l1), "MANDEL RSP  %s", view_name);
+            snprintf(l2, sizeof(l2), "X%s Y%s SPAN %s %s IT%d",
+                     xs, ys, sp, use_rsp ? "RSP" : "CPU", iters);
+            uint32_t cblack = color_to_packed32(RGBA32(0, 0, 0, 255));
+            uint32_t cwhite = color_to_packed32(RGBA32(255, 255, 255, 255));
+            uint32_t cteal  = color_to_packed32(RGBA32(0, 255, 170, 255));
+            for (int y = 0; y < 10; y++)
+                for (int x = 0; x < W; x++) pix[y * W + x] = cblack;
+            hud_text(pix, 4, 1, l1, cwhite, cblack);
+            for (int y = 10; y < 20; y++)
+                for (int x = 0; x < W; x++) pix[y * W + x] = cblack;
+            hud_text(pix, 4, 11, l2, cteal, cblack);
+        }
+
+        if ((frame % 60) == 0
+#ifdef AUTOTEST
+            || 1
+#endif
+        ) {
             char line[256];
             int n = snprintf(line, sizeof(line),
-                "[probe] f=%ld cx=%.9f cy=%.9f span=%.8f path=%s mism=%d max=%d it=%d rsp_ms=%lld\n",
+                "[probe] f=%ld cx=%.9f cy=%.9f span=%.8f path=%s mism=%d max=%d it=%d rsp_ms=%lld btn=%04X conn=%d fly=%d name=%s\n",
                 (long)frame, cx0, cy0, span, use_rsp ? "rsp" : "cpu",
                 mismatch, maxc, iters,
-                (long long)(us_rsp / 1000));
+                (long long)(us_rsp / 1000), jin.btn.raw,
+                (int)joypad_is_connected(JOYPAD_PORT_1), fly_active, view_name);
             static uint8_t isvbuf[256] __attribute__((aligned(8)));
             for (int i = 0; i < n; i++) isvbuf[i] = (uint8_t)line[i];
             for (int i = 0; i < n; i += 4) {
