@@ -76,20 +76,22 @@ static inline int q12(double v)
 DEFINE_RSP_UCODE(rsp_mandel);
 
 #define NCHUNK   (W / 8)                  /* 40 chunks of 8 lanes */
-/* stage halfword-index helpers (byte offset >> 1).
-   sout (escape S q8) occupies 0x0A80..0x0D00; constants/probe at 0x0D00+ */
-#define CR_HW    (0x0000 / 2)
-#define CI_HW    (0x0400 / 2)
-#define OUT_BYTE 0x0800                   /* counts (640B) + sout (640B) */
-#define NC_HW    (0x0D00 / 2)
-#define ESC_HW   (0x0D40 / 2)
-#define ONE_HW   (0x0D50 / 2)
-#define ESCM_HW  (0x0D60 / 2)
+/* stage halfword-index helpers (byte offset >> 1) — stage-F ucode map:
+   0x0000 row0 out | 0x0280 row0 sout | 0x0500 row1 out | 0x0780 row1 sout
+   0x0A00 x-LUT (resident) | 0x0C80 nchunks | 0x0C90 one | 0x0CA0 escm
+   0x0CB0 ci0 | 0x0CC0 ci1 | 0x0D80 probe */
+#define OUT_BYTE 0x0000                   /* read-back span start (2 KB) */
+#define NC_HW    (0x0C80 / 2)
+#define ONE_HW   (0x0C90 / 2)
+#define ESCM_HW  (0x0CA0 / 2)
+#define XLUT_HW  (0x0A00 / 2)
+#define CI0_HW   (0x0CB0 / 2)
+#define RUNUP_HW (0x0CD0 / 2)           /* upload span 0x0A00..0x0CC0 */
 #define PROBE_HW (0x0D80 / 2)
 #define STAGE_HW (0x0E70 / 2)
 
 static uint16_t stage[STAGE_HW] __attribute__((aligned(8)));
-static uint16_t rdbuf[W * 2] __attribute__((aligned(8)));  /* counts|sout */
+static uint16_t rdbuf[1280] __attribute__((aligned(8)));   /* 2 rows: cnt|S ×2 */
 #endif /* USE_RSP */
 
 /* ---------------- zoom tour keyframes ----------------
@@ -194,12 +196,13 @@ int main(void)
     rsp_init();
     rsp_load(&rsp_mandel);
     for (int i = 0; i < 8; i++) {
-        stage[ESC_HW + i] = 1024;    /* q8 radius-² = 4.0 */
         stage[ONE_HW + i] = 1;
         stage[ESCM_HW + i] = 1023;   /* esc-1: borrow test S >= 1024 */
     }
     uint32_t nch = NCHUNK;
     memcpy(&stage[NC_HW], &nch, 4);
+    /* ucode boots once; x-LUT + ci-pair + nchunks re-uploaded per run */
+    rsp_load_data(stage, sizeof(stage), 0);
 #endif
 
     long frame = 0;
@@ -228,8 +231,8 @@ int main(void)
         us_pack += TIMER_MICROS_LL(timer_ticks() - t0);
 
 #if USE_RSP
-        memcpy(&stage[CR_HW], cxq, sizeof(cxq));
-        /* one rsp_run per row */
+        memcpy(&stage[XLUT_HW], cxq, sizeof(cxq));
+        /* STAGE F: two rows per rsp_run (ci-pair @0x0CB0/0x0CC0) */
         int rowmax = H;
         int mirror = 0;
         double ytop = cy0 - span / 2;
@@ -245,9 +248,13 @@ int main(void)
             rowmax = H;
         }
 
-        for (int y = 0; y < rowmax; y++) {
-            uint16_t ci = cyq[y];
-            for (int x = 0; x < W; x++) stage[CI_HW + x] = ci;
+        for (int y = 0; y < rowmax; y += 2) {
+            uint16_t c0 = cyq[y];
+            uint16_t c1 = (y + 1 < rowmax) ? cyq[y + 1] : c0;
+            for (int i = 0; i < 8; i++) {
+                stage[CI0_HW + i] = c0;
+                stage[CI0_HW + 8 + i] = c1;
+            }
             data_cache_hit_writeback_invalidate(stage, sizeof(stage));
 
             rsp_load_data(stage, sizeof(stage), 0);
@@ -255,8 +262,13 @@ int main(void)
             rsp_run();
             rsp_read_data(rdbuf, sizeof(rdbuf), OUT_BYTE);
             us_rsp += TIMER_MICROS_LL(timer_ticks() - t0);
+            int y2 = y + 1;
             memcpy(rows_cnt[y], rdbuf, W * 2);
             memcpy(rows_s[y], rdbuf + W, W * 2);
+            if (y2 < rowmax) {
+                memcpy(rows_cnt[y2], rdbuf + 2 * W, W * 2);
+                memcpy(rows_s[y2], rdbuf + 3 * W, W * 2);
+            }
         }
 
         int minc = 999, maxc = 0, mismatch = 0;
@@ -327,12 +339,9 @@ int main(void)
         if ((frame % 60) == 0) {
             char line[256];
             int n = snprintf(line, sizeof(line),
-                "[probe] f=%ld cx=%.6f cy=%.6f span=%.5f mism=%d max=%d mm0=%d/%d/%d/%d mm1=%d/%d/%d/%d\n",
+                "[probe] f=%ld cx=%.6f cy=%.6f span=%.5f mism=%d max=%d rsp_ms=%lld\n",
                 (long)frame, cx0, cy0, span, mismatch, maxc,
-                mmc > 0 ? mm_y[0] : -1, mmc > 0 ? mm_x[0] : -1,
-                mmc > 0 ? mm_v[0] : -1, mmc > 0 ? mm_r[0] : -1,
-                mmc > 1 ? mm_y[1] : -1, mmc > 1 ? mm_x[1] : -1,
-                mmc > 1 ? mm_v[1] : -1, mmc > 1 ? mm_r[1] : -1);
+                (long long)(us_rsp / 1000));
             static uint8_t isvbuf[256] __attribute__((aligned(8)));
             for (int i = 0; i < n; i++) isvbuf[i] = (uint8_t)line[i];
             for (int i = 0; i < n; i += 4) {
