@@ -23,6 +23,9 @@ pull back; smooth palette, RSP frames `mism=0`, deep frame 99.67% numpy-agreemen
 | `mandel/rsp_mandel.S` | the custom RSP ucode (q12 fixed point, `vmudm` exact squares, VCO borrow-chain escape freeze) |
 | `mandel/test/probe.js` | headless test script for the ares-64 `ares-test` JS runner |
 | `mandel/test/deepcap.js` | deep-zoom frame capture (boots at `START_FRAME=…`) |
+| `mandel/test/tourcap.js` | full-tour frame capture (every 15th sim frame) |
+| `mandel/test/input.js` | controller-injection test (stick/zoom/d-pad hashes) |
+| `mandel/tools/encode_tour.sh` | minterpolate 2→30 fps H.264 encode of tour frames |
 | `mandel/test/deepcheck.py` | numpy double-precision cross-check of deep frames |
 | `mandel/DESIGN.md` | original ucode design spec |
 | `tools/n64test_ares.sh` | xvfb harness for official Ares captures |
