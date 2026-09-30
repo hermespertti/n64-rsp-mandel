@@ -629,7 +629,9 @@ int main(void)
         int lr = jin.btn.l && jin.btn.r;
         if (lr && !prev_lr) cycle_on = !cycle_on;
         prev_z = jin.btn.z; prev_a = jin.btn.a; prev_lr = lr;
+#ifndef PERT_TEST
         if (pad_active && pad_inactive_frames > 300) { auto_mode = 1; pad_active = 0; }
+#endif
 
         double cx0, cy0, span;
         const char *view_name;
