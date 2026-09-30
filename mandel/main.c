@@ -152,6 +152,12 @@ static int  ring_n = 0;
 static double hold_cx = 0, hold_cy = 0, hold_span = -1;
 static int    hold_n = 0;
 
+/* stage P static caching: deep frames recompute only when the view moves;
+   a held deep view displays its cached painted buffer for FREE, and one
+   full-res render per bucket upgrades quality (fq keys). */
+static uint32_t hold_pix[W * H];
+static int      hold_valid = 0;
+
 
 
 
@@ -685,38 +691,40 @@ int main(void)
         }
 #endif /* USE_RSP */
 
-        int morphed = 0, fq_brk = 0, qpainted = 0;
+        int morphed = 0, qpainted = 0;
         /* stage P hold tracker: same view spans consecutive frames */
         if (cx0 == hold_cx && cy0 == hold_cy && span == hold_span) hold_n++;
         else { hold_cx = cx0; hold_cy = cy0; hold_span = span; hold_n = 1; }
+        if (use_rsp) hold_valid = 0;
+        if (!use_rsp && hold_valid && hold_n >= 2) {
+            /* deep view held: re-display cached paint for FREE unless a
+               full-quality upgrade is pending (bucket without fq key) */
+            int bkt = (int)floor(log(RING_TOP / span) / log(2.0));
+            if (bkt < 0) bkt = 0;
+            int slot = bkt % RING_CAP;
+            int upg = hold_n >= HOLD_FRAMES && !(ring[slot].valid && ring[slot].fq);
+            if (!upg) {
+                memcpy(pix, hold_pix, sizeof(hold_pix));
+                qpainted = 1;
+            }
+        }
 #ifndef RING_OFF
-        if (!use_rsp) {
-            /* deep zone: prefer ring morph (fast) over CPU render (slow) */
+        if (!use_rsp && !qpainted) {
+            /* deep zone: prefer ring morph over CPU render; a held view
+               whose bracket lacks fq keys falls through to the upgrade */
             int ia, ib;
-            if (ring_lookup(cx0, cy0, span, &ia, &ib)) {
-                fq_brk = ring[ia].fq && ring[ib].fq;
-#ifndef NO_PROG
-                /* morph available: play it — unless the view holds still on
-                   non-full-quality keys, then spend one full-res upgrade */
-                if (!fq_brk && hold_n >= HOLD_FRAMES) { /* fall to full */ }
-                else
-#endif
-                {
-                    ring_morph(pix, cx0, cy0, span, ia, ib);
-                    morphed = 1;
-                }
+            if (ring_lookup(cx0, cy0, span, &ia, &ib) &&
+                ((ring[ia].fq && ring[ib].fq) || hold_n < HOLD_FRAMES)) {
+                ring_morph(pix, cx0, cy0, span, ia, ib);
+                morphed = 1;
             }
         }
 #endif
-        if (!use_rsp && !morphed) {
-            /* stage P policy: first frame(s) of a view = quarter lattice
-               (~700 ms), then once view holds HOLD_FRAMES, one full-res
-               render upgrades the bucket key (fq=1); morph plays fq after. */
-#ifndef NO_PROG
+        if (!use_rsp && !morphed && !qpainted) {
+            /* first frame of a view = quarter lattice (~0.84 s vs 6.5 s);
+               once held, one full-res render upgrades the bucket key
+               (fq=1) and refreshes the static cache. */
             int fullq = (hold_n >= HOLD_FRAMES);
-#else
-            int fullq = 1;
-#endif
             if (fullq) {
                 /* full-res CPU pass: upgrade rows_cnt + fq ring key */
                 for (int y = 0; y < H; y++) {
@@ -834,13 +842,17 @@ int main(void)
         }
         us_paint += TIMER_MICROS_LL(timer_ticks() - t1);
 
-        /* harvest ring key from genuine full-res render (this block only
-           runs for RSP and fullq frames; quarter-painted frames saved their
-           own q-key inside the compute block). fq=1 marks full quality. */
         /* deep render: harvest a ring key only from genuine full-res CPU
            frames (not morph playback). */
         if (!use_rsp && !morphed)
             ring_save(cx0, cy0, span, pix);
+        }
+
+        /* static cache refresh: any freshly computed/morphed deep frame
+           becomes the free-display content for a held view */
+        if (!use_rsp) {
+            memcpy(hold_pix, pix, sizeof(hold_pix));
+            hold_valid = 1;
         }
 
         /* ---- HUD ---- */
