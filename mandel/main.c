@@ -213,6 +213,22 @@ static inline uint32_t blend32(uint32_t c0, uint32_t c1, int t8)
     return (uint32_t)r | ((uint32_t)g << 8) | ((uint32_t)b << 16) | 0xFF000000u;
 }
 
+/* stage M: bilinear texel fetch — half-res keys upscale with AA instead
+   of stair-stepped nearest neighbour. fx/fy are 8-bit fractions. */
+static inline uint32_t bil_key(const RKey *k, int xa, int ya)
+{
+    int sx = xa >> 16, sy = ya >> 16;
+    int fx = (xa >> 8) & 255, fy = (ya >> 8) & 255;
+    if (sx < 0) { sx = 0; fx = 0; }
+    if (sy < 0) { sy = 0; fy = 0; }
+    if (sx > RW - 2) sx = RW - 2;
+    if (sy > RH - 2) sy = RH - 2;
+    const uint32_t *r0 = k->px + (size_t)sy * RW + sx;
+    const uint32_t *r1 = r0 + RW;
+    return blend32(blend32(r0[0], r0[1], fx),
+                   blend32(r1[0], r1[1], fx), fy);
+}
+
 /* Affine map each output pixel into both keys' textures (integer q16 steps,
    MIPS-friendly) and blend. Exact geometry: u = (w - key.c)/key.span + 0.5 */
 static void ring_morph(uint32_t *out, double cx, double cy, double span, int ia, int ib)
@@ -236,21 +252,10 @@ static void ring_morph(uint32_t *out, double cx, double cy, double span, int ia,
         int xb = (int)(((vx0 - kb->cx) * sb + 0.5) * 65536.0);
         uint32_t *o = out + (size_t)y * W;
         for (int x = 0; x < W; x++) {
-            int sax = xa >> 16, say = ya >> 16;
-            int sbx = xb >> 16, sby = yb >> 16;
-            if (sax < 0) sax = 0;
-            if (sax >= RW) sax = RW - 1;
-            if (say < 0) say = 0;
-            if (say >= RH) say = RH - 1;
-            if (sbx < 0) sbx = 0;
-            if (sbx >= RW) sbx = RW - 1;
-            if (sby < 0) sby = 0;
-            if (sby >= RH) sby = RH - 1;
-            o[x] = blend32(ka->px[say * RW + sax], kb->px[sby * RW + sbx], t8);
+            o[x] = blend32(bil_key(ka, xa, ya), bil_key(kb, xb, yb), t8);
             xa += dxa; xb += dxb;
         }
-        /* vertical steps: dy/span maps view rows onto texel rows */
-        ya = 0; yb = 0;
+        /* vertical steps handled by wy at row top */
         (void)ya; (void)yb;
     }
     (void)dy;
@@ -264,6 +269,19 @@ static const Preset presets[] = {
     { -0.745000,         -0.115000,         0.30,  "VALLEY" },
 };
 #define NPRESET ((int)(sizeof(presets)/sizeof(presets[0])))
+
+/* stage M: user bookmarks — save current view on X, fly with ZL */
+#define NBOOK 8
+typedef struct { double cx, cy, span; int valid; } Book;
+static Book books[NBOOK] = { {0} };
+static int  book_slot = 0;
+
+/* stage M: palette cycling — hue phase drift folded into smooth lookup */
+static int pal_phase = 0;        /* added to smooth_color idx */
+static int cycle_on = 1;
+static int book_blink = 0;       /* HUD blink frames after save/recall */
+static long long hud_tprev = 0;  /* fps EMA state */
+static long long hud_fps = 60000;/* fps * 1000, EMA over frame times */
 
 static int   fly_active = 0;
 static double f_cx, f_cy, f_span;
@@ -341,7 +359,7 @@ static inline uint32_t smooth_color(int n, uint16_t S)
 {
     if (n >= g_interior) return color_to_packed32(RGBA32(8, 4, 16, 255));
     int sm = n * 4096 + (int)smooth_tab[S > 32767 ? 32767 : S];
-    int idx = (sm * 4) >> 11;
+    int idx = ((sm * 4) >> 11) + pal_phase;
     return pal_lut[idx & (PALN - 1)];
 }
 
@@ -489,6 +507,29 @@ int main(void)
         static int prev_b = 0;
         if (jin.btn.b && !prev_b) hud_on = !hud_on;
         prev_b = jin.btn.b;
+        /* stage M: Z save bookmark, A recall, L+R palette cycle toggle */
+        static int prev_z = 0, prev_a = 0, prev_lr = 0;
+        if (jin.btn.z && !prev_z) {
+            books[book_slot].cx = vcx; books[book_slot].cy = vcy;
+            books[book_slot].span = vspan; books[book_slot].valid = 1;
+            book_slot = (book_slot + 1) % NBOOK;
+            book_blink = 90;
+        }
+        if (jin.btn.a && !prev_a) {
+            int s = -1;
+            for (int i = NBOOK - 1; i >= 0; i--)
+                if (books[i].valid) { s = i; break; }
+            if (s >= 0) {
+                fly_active = 1;
+                f_cx = books[s].cx; f_cy = books[s].cy; f_span = books[s].span;
+                fly_name = "BOOKMARK";
+                auto_mode = 0; pad_active = 1;
+                book_blink = 90;
+            }
+        }
+        int lr = jin.btn.l && jin.btn.r;
+        if (lr && !prev_lr) cycle_on = !cycle_on;
+        prev_z = jin.btn.z; prev_a = jin.btn.a; prev_lr = lr;
         if (pad_active && pad_inactive_frames > 300) { auto_mode = 1; pad_active = 0; }
 
         double cx0, cy0, span;
@@ -514,8 +555,9 @@ int main(void)
         } else {
             view_name = "MANUAL";
             double zoomf = 1.0;
-            if (jin.btn.z || jin.btn.r) zoomf = 0.94;          /* zoom in */
-            if (jin.btn.l) zoomf = 1.06;                        /* zoom out */
+            /* stage M: ZR zoom in, ZL zoom out (C-buttons keep preset fly) */
+            if (jin.btn.r) zoomf = 0.94;                     /* ZR */
+            if (jin.btn.l) zoomf = 1.06;                     /* ZL */
             double pan_scale = vspan / 900.0;
             double mx = (sx ? (double)sx : (double)bx * 60.0);
             double my = (sy ? -(double)sy : (double)by * 60.0); /* stick up = -imag */
@@ -679,24 +721,48 @@ int main(void)
         }
 
         /* ---- HUD ---- */
+        if (cycle_on) pal_phase = (pal_phase + 3) & (PALN - 1);
+        if (book_blink > 0) book_blink--;
+        /* fps: EMA over real elapsed ticks (2 ms granularity timer) */
+        long long now = timer_ticks();
+        long long dt_us = TIMER_MICROS_LL(now - hud_tprev);
+        hud_tprev = now;
+        if (dt_us > 0 && dt_us < 60000000)
+            hud_fps += (1000000000 / dt_us - hud_fps) / 8;
+        if (hud_fps < 1) hud_fps = 1;
+        long long fps_milli = hud_fps;   /* fps * 1000 */
         if (hud_on) {
             char sp[16]; fmt_span(span, sp);
             char xs[12], ys[12];
             snprintf(xs, sizeof(xs), "%.6f", cx0);
             snprintf(ys, sizeof(ys), "%.6f", cy0);
-            char l1[64], l2[64];
-            snprintf(l1, sizeof(l1), "MANDEL RSP  %s", view_name);
+            char l1[64], l2[64], l3[64];
+            snprintf(l1, sizeof(l1), "MANDEL 64  %s", view_name);
             snprintf(l2, sizeof(l2), "X%s Y%s SPAN %s %s IT%d",
                      xs, ys, sp, use_rsp ? "RSP" : "CPU", iters);
+            snprintf(l3, sizeof(l3), "%dFPS  %s CYC%d BK%d",
+                     (int)(hud_fps / 1000),
+                     morphed ? "MORPH" : "RENDER",
+                     cycle_on, book_slot);
             uint32_t cblack = color_to_packed32(RGBA32(0, 0, 0, 255));
             uint32_t cwhite = color_to_packed32(RGBA32(255, 255, 255, 255));
             uint32_t cteal  = color_to_packed32(RGBA32(0, 255, 170, 255));
+            uint32_t cyel   = color_to_packed32(RGBA32(255, 220, 60, 255));
             for (int y = 0; y < 10; y++)
                 for (int x = 0; x < W; x++) pix[y * W + x] = cblack;
             hud_text(pix, 4, 1, l1, cwhite, cblack);
             for (int y = 10; y < 20; y++)
                 for (int x = 0; x < W; x++) pix[y * W + x] = cblack;
             hud_text(pix, 4, 11, l2, cteal, cblack);
+            /* ring occupancy bar + morph badge */
+            for (int y = 20; y < 28; y++)
+                for (int x = 0; x < W; x++) pix[y * W + x] = cblack;
+            hud_text(pix, 4, 21, l3, book_blink ? cyel : cteal, cblack);
+            int bx0 = W - 8 * 24 - 6;
+            for (int i = 0; i < RING_CAP; i++) {
+                uint32_t cc = ring[i].valid ? cteal : color_to_packed32(RGBA32(40, 40, 40, 255));
+                hud_char(pix, bx0 + i * 8, 21, ring[i].valid ? '#' : '.', cc, cblack);
+            }
         }
 
         display_show(fb);
@@ -710,10 +776,10 @@ int main(void)
         ) {
             char line[256];
             int n = snprintf(line, sizeof(line),
-                "[probe] f=%ld cx=%.9f cy=%.9f span=%.8f path=%s mism=%d max=%d it=%d rsp_ms=%lld btn=%04X conn=%d fly=%d name=%s keys=%d morph=%d mm0=%d/%d/%d/%d\n",
+                "[probe] f=%ld cx=%.9f cy=%.9f span=%.8f path=%s mism=%d max=%d it=%d rsp_ms=%lld fps1000=%lld btn=%04X conn=%d fly=%d name=%s keys=%d morph=%d mm0=%d/%d/%d/%d\n",
                 (long)frame, cx0, cy0, span, use_rsp ? "rsp" : "cpu",
                 mismatch, maxc, iters,
-                (long long)(us_rsp / 1000), jin.btn.raw,
+                (long long)(us_rsp / 1000), fps_milli, jin.btn.raw,
                 (int)joypad_is_connected(JOYPAD_PORT_1), fly_active, view_name,
                 ring_n, morphed,
                 mm_y[0], mm_x[0], mm_v[0], mm_r[0]);

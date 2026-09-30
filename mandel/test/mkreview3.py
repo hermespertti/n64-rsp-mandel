@@ -9,7 +9,7 @@
 import glob, os, subprocess, sys
 
 B = "/home/lex/n64/mandel/test/"
-OUT = "/home/lex/n64/mandel/review.mp4"
+OUT = "/home/lex/n64/mandel/reviewM.mp4"
 TMP = B + "segs/"
 
 def find_font():
