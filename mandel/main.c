@@ -141,9 +141,19 @@ static int   hud_on = 1;
 #define RW         (W / 2)         /* ring key resolution: half, upscaled on */
 #define RH         (H / 2)
 
-typedef struct { double span, cx, cy; int valid; uint32_t px[RW * RH]; } RKey;
+typedef struct { double span, cx, cy; int valid, fq; uint32_t px[RW * RH]; } RKey;
 static RKey ring[RING_CAP] = { {0} };
 static int  ring_n = 0;
+
+/* stage P hold-upgrade: first deep frame per bucket renders quarter-res
+   (fast); once the view holds still for HOLD_FRAMES, one full-res CPU
+   render upgrades that bucket's key to full quality (fq=1). */
+#define HOLD_FRAMES 3
+static double hold_cx = 0, hold_cy = 0, hold_span = -1;
+static int    hold_n = 0;
+
+
+
 
 /* Can the ring represent this view? Bracketing keys within log-span window
    and pan tolerance; affine map is exact, slight pan shows as edge clamp
@@ -172,20 +182,6 @@ static int ring_lookup(double cx, double cy, double span, int *ia, int *ib)
     return 1;
 }
 
-/* Is this view already covered? Bucket scheme: one key per log-span bucket
-   (ratio RING_RATIO) per center region; morph works between adjacent buckets. */
-static int ring_covers(double cx, double cy, double span)
-{
-    double lv = log(span);
-    for (int i = 0; i < ring_n; i++) {
-        if (!ring[i].valid) continue;
-        if (fabs(log(ring[i].span) - lv) >= log(RING_RATIO)) continue;
-        double dx = fabs(cx - ring[i].cx), dy = fabs(cy - ring[i].cy);
-        if (dx > ring[i].span * 0.6 || dy > ring[i].span * 0.6) continue;
-        return 1;
-    }
-    return 0;
-}
 
 static void ring_save(double cx, double cy, double span, const uint32_t *pix)
 {
@@ -201,7 +197,7 @@ static void ring_save(double cx, double cy, double span, const uint32_t *pix)
         const uint32_t *s = pix + (size_t)(y * 2) * W;
         for (int x = 0; x < RW; x++) d[y * RW + x] = s[x * 2];
     }
-    k->valid = 1;
+    k->valid = 1; k->fq = 1;
     if (slot + 1 > ring_n) ring_n = slot + 1;
 }
 
@@ -321,7 +317,18 @@ static uint16_t cyq[H];                  /* q12 c_y per row */
 static uint16_t rows_cnt[H][W];         /* ucode escape counts */
 static uint16_t rows_s[H][W];           /* ucode escape S q8 */
 
-/* smooth palette */
+/* stage P: quarter-res progressive deep rendering (CPU path).
+ * Deep first-visit frames render the exact iteration field on a 4x coarser
+ * lattice (QW x QH = 80x60 = 1/16 the pixels) and display via bilinear 4x
+ * upscale — ~16x cheaper than full CPU, ~19 ms budget at 1200 iter. Painted
+ * colors live in qring slots; motion morphs between quarter keys (qring_*),
+ * holds upgrade half-res keys via occasional full CPU frames (ring_save).
+ * NO_PROG reverts to per-frame full-res CPU deep rendering. */
+#define QW (W / 4)
+#define QH (H / 4)
+#define QBANDS 8
+static uint16_t q_cnt[QH][QW];
+static uint16_t q_s[QH][QW];
 #define PALN 4096
 static uint32_t pal_lut[PALN];
 static int16_t  smooth_tab[32768];     /* S q8 → 4096·(P_B − P(|z|)) */
@@ -361,6 +368,38 @@ static inline uint32_t smooth_color(int n, uint16_t S)
     int sm = n * 4096 + (int)smooth_tab[S > 32767 ? 32767 : S];
     int idx = ((sm * 4) >> 11) + pal_phase;
     return pal_lut[idx & (PALN - 1)];
+}
+
+static void ring_save_q(double cx, double cy, double span, const uint16_t *qc, const uint16_t *qs)
+{
+    /* quarter lattice (q_cnt/q_s) -> half-res key via bilinear smooth color;
+       never clobber a full-quality key. */
+    int bkt = (int)floor(log(RING_TOP / span) / log(2.0));
+    if (bkt < 0) bkt = 0;
+    int slot = bkt % RING_CAP;
+    RKey *k = &ring[slot];
+    if (k->valid && k->fq) return;
+    k->cx = cx; k->cy = cy; k->span = span;
+    for (int y = 0; y < RH; y++) {
+        uint32_t *dd = k->px + (size_t)y * RW;
+        double qy = y * 0.5;
+        int y0q = (int)qy; double ty = qy - y0q;
+        if (y0q >= QH - 1) { y0q = QH - 2; ty = 1.0; }
+        int tyi = (int)(ty * 255);
+        for (int x = 0; x < RW; x++) {
+            double qx = x * 0.5;
+            int x0q = (int)qx; double tx = qx - x0q;
+            if (x0q >= QW - 1) { x0q = QW - 2; tx = 1.0; }
+            int txi = (int)(tx * 255);
+            uint32_t c00 = smooth_color(qc[y0q * QW + x0q], qs[y0q * QW + x0q]);
+            uint32_t c10 = smooth_color(qc[y0q * QW + x0q + 1], qs[y0q * QW + x0q + 1]);
+            uint32_t c01 = smooth_color(qc[(y0q + 1) * QW + x0q], qs[(y0q + 1) * QW + x0q]);
+            uint32_t c11 = smooth_color(qc[(y0q + 1) * QW + x0q + 1], qs[(y0q + 1) * QW + x0q + 1]);
+            dd[x] = blend32(blend32(c00, c10, txi), blend32(c01, c11, txi), tyi);
+        }
+    }
+    k->valid = 1; k->fq = 0;
+    if (slot + 1 > ring_n) ring_n = slot + 1;
 }
 
 /* view interpolation for global frame f */
@@ -578,6 +617,8 @@ int main(void)
             cyq[y] = (uint16_t)q12(y0 + dy * y);
         us_pack += TIMER_MICROS_LL(timer_ticks() - t0);
 
+        long long tdeep0 = timer_ticks();   /* stage P: deep compute cost */
+
         int use_rsp = 0;
 #if USE_RSP
         use_rsp = span >= RSP_MIN_SPAN;
@@ -644,61 +685,139 @@ int main(void)
         }
 #endif /* USE_RSP */
 
-        int morphed = 0;
+        int morphed = 0, fq_brk = 0, qpainted = 0;
+        /* stage P hold tracker: same view spans consecutive frames */
+        if (cx0 == hold_cx && cy0 == hold_cy && span == hold_span) hold_n++;
+        else { hold_cx = cx0; hold_cy = cy0; hold_span = span; hold_n = 1; }
 #ifndef RING_OFF
         if (!use_rsp) {
             /* deep zone: prefer ring morph (fast) over CPU render (slow) */
             int ia, ib;
             if (ring_lookup(cx0, cy0, span, &ia, &ib)) {
-                ring_morph(pix, cx0, cy0, span, ia, ib);
-                morphed = 1;
+                fq_brk = ring[ia].fq && ring[ib].fq;
+#ifndef NO_PROG
+                /* morph available: play it — unless the view holds still on
+                   non-full-quality keys, then spend one full-res upgrade */
+                if (!fq_brk && hold_n >= HOLD_FRAMES) { /* fall to full */ }
+                else
+#endif
+                {
+                    ring_morph(pix, cx0, cy0, span, ia, ib);
+                    morphed = 1;
+                }
             }
         }
 #endif
         if (!use_rsp && !morphed) {
-            /* deep view: CPU double pipeline, full coordinate precision.
-             * L1: exact main-cardioid + period-2-bulb interior tests skip the
-             * full-iteration worst case for interior pixels. */
-            for (int y = 0; y < H; y++) {
-                double ci = y0 + dy * y;
-                double ci2 = ci * ci;
-                double bp1 = (ci + 1.0) * (ci + 1.0);   /* reserved for symmetry views */
-                (void)bp1;
-                for (int x = 0; x < W; x++) {
-                    double cr = x0 + dx * x;
-                    double zr = 0, zi = 0, S = 0;
-                    int cnt = iters;
-#if !defined(NO_L1)
-                    double crm = cr - 0.25;
-                    double q = crm * crm + ci2;
-                    if (q * (q + crm) < 0.25 * ci2) {
-                        cnt = iters; S = q;             /* main cardioid interior */
-                    } else if ((cr + 1.0) * (cr + 1.0) + ci2 < 0.0625) {
-                        cnt = iters; S = 0.0;           /* period-2 bulb interior */
-                    } else
+            /* stage P policy: first frame(s) of a view = quarter lattice
+               (~700 ms), then once view holds HOLD_FRAMES, one full-res
+               render upgrades the bucket key (fq=1); morph plays fq after. */
+#ifndef NO_PROG
+            int fullq = (hold_n >= HOLD_FRAMES);
 #else
-                    if (0) { } else
+            int fullq = 1;
 #endif
-                    {
-                        for (int i = 0; i < iters; i++) {
-                            double r2 = zr * zr, i2 = zi * zi;
-                            S = r2 + i2;
-                            if (S >= 4.0) { cnt = i; break; }
-                            double t = r2 - i2;
-                            zi = 2.0 * zr * zi + ci;
-                            zr = t + cr;
+            if (fullq) {
+                /* full-res CPU pass: upgrade rows_cnt + fq ring key */
+                for (int y = 0; y < H; y++) {
+                    double ci = y0 + dy * y;
+                    double ci2 = ci * ci;
+                    for (int x = 0; x < W; x++) {
+                        double cr = x0 + dx * x;
+                        double zr = 0, zi = 0, S = 0;
+                        int cnt = iters;
+#if !defined(NO_L1)
+                        double crm = cr - 0.25;
+                        double q = crm * crm + ci2;
+                        if (q * (q + crm) < 0.25 * ci2) {
+                            cnt = iters; S = q;
+                        } else if ((cr + 1.0) * (cr + 1.0) + ci2 < 0.0625) {
+                            cnt = iters; S = 0.0;
+                        } else
+#else
+                        if (0) { } else
+#endif
+                        {
+                            for (int i = 0; i < iters; i++) {
+                                double r2 = zr * zr, i2 = zi * zi;
+                                S = r2 + i2;
+                                if (S >= 4.0) { cnt = i; break; }
+                                double t = r2 - i2;
+                                zi = 2.0 * zr * zi + ci;
+                                zr = t + cr;
+                            }
                         }
+                        if (cnt > maxc) maxc = cnt;
+                        int s8 = (int)(S * 1024.0);
+                        rows_cnt[y][x] = (uint16_t)cnt;
+                        rows_s[y][x] = (uint16_t)(s8 > 32767 ? 32767 : (s8 < 0 ? 0 : s8));
                     }
-                    rows_cnt[y][x] = (uint16_t)cnt;
-                    if (cnt > maxc) maxc = cnt;
-                    int s8 = (int)(S * 1024.0);
-                    rows_s[y][x] = (uint16_t)(s8 > 32767 ? 32767 : (s8 < 0 ? 0 : s8));
                 }
+            } else {
+                /* quarter lattice pass (stage P) */
+                for (int qy = 0; qy < QH; qy++) {
+                    double ci = y0 + dy * (qy * 4);
+                    double ci2 = ci * ci;
+                    for (int qx = 0; qx < QW; qx++) {
+                        double cr = x0 + dx * (qx * 4);
+                        double zr = 0, zi = 0, S = 0;
+                        int cnt = iters;
+#if !defined(NO_L1)
+                        double crm = cr - 0.25;
+                        double q = crm * crm + ci2;
+                        if (q * (q + crm) < 0.25 * ci2) {
+                            cnt = iters; S = q;
+                        } else if ((cr + 1.0) * (cr + 1.0) + ci2 < 0.0625) {
+                            cnt = iters; S = 0.0;
+                        } else
+#else
+                        if (0) { } else
+#endif
+                        {
+                            for (int i = 0; i < iters; i++) {
+                                double r2 = zr * zr, i2 = zi * zi;
+                                S = r2 + i2;
+                                if (S >= 4.0) { cnt = i; break; }
+                                double t = r2 - i2;
+                                zi = 2.0 * zr * zi + ci;
+                                zr = t + cr;
+                            }
+                        }
+                        if (cnt > maxc) maxc = cnt;
+                        int s8 = (int)(S * 1024.0);
+                        q_cnt[qy][qx] = (uint16_t)cnt;
+                        q_s[qy][qx] = (uint16_t)(s8 > 32767 ? 32767 : (s8 < 0 ? 0 : s8));
+                    }
+                }
+                /* bilinear color upsample q -> full display */
+                qpainted = 1;
+                for (int y = 0; y < H; y++) {
+                    double qy = y * 0.25;
+                    int y0q = (int)qy;
+                    double ty = qy - y0q;
+                    if (y0q >= QH - 1) { y0q = QH - 2; ty = 1.0; }
+                    uint32_t *d = pix + (size_t)y * W;
+                    for (int x = 0; x < W; x++) {
+                        double qx = x * 0.25;
+                        int x0q = (int)qx;
+                        double tx = qx - x0q;
+                        if (x0q >= QW - 1) { x0q = QW - 2; tx = 1.0; }
+                        uint32_t c00 = smooth_color(q_cnt[y0q][x0q], q_s[y0q][x0q]);
+                        uint32_t c10 = smooth_color(q_cnt[y0q][x0q + 1], q_s[y0q][x0q + 1]);
+                        uint32_t c01 = smooth_color(q_cnt[y0q + 1][x0q], q_s[y0q + 1][x0q]);
+                        uint32_t c11 = smooth_color(q_cnt[y0q + 1][x0q + 1], q_s[y0q + 1][x0q + 1]);
+                        int txi = (int)(tx * 255), tyi = (int)(ty * 255);
+                        d[x] = blend32(blend32(c00, c10, txi), blend32(c01, c11, txi), tyi);
+                    }
+                }
+                /* quarter key: bilinear q -> half-res slot (skips fq keys) */
+                ring_save_q(cx0, cy0, span, &q_cnt[0][0], &q_s[0][0]);
             }
         }
 
+        long long us_deep = TIMER_MICROS_LL(timer_ticks() - tdeep0);
         long long t1 = timer_ticks();
-        if (!morphed) {
+        if (!morphed && !qpainted) {
         for (int y = 0; y < rowmax; y++) {
             uint32_t *d = pix + (size_t)y * W;
             uint16_t *cn = rows_cnt[y], *ss = rows_s[y];
@@ -715,8 +834,12 @@ int main(void)
         }
         us_paint += TIMER_MICROS_LL(timer_ticks() - t1);
 
-        /* deep render: harvest a ring key if this view isn't covered yet */
-        if (!use_rsp && !ring_covers(cx0, cy0, span))
+        /* harvest ring key from genuine full-res render (this block only
+           runs for RSP and fullq frames; quarter-painted frames saved their
+           own q-key inside the compute block). fq=1 marks full quality. */
+        /* deep render: harvest a ring key only from genuine full-res CPU
+           frames (not morph playback). */
+        if (!use_rsp && !morphed)
             ring_save(cx0, cy0, span, pix);
         }
 
@@ -776,10 +899,10 @@ int main(void)
         ) {
             char line[256];
             int n = snprintf(line, sizeof(line),
-                "[probe] f=%ld cx=%.9f cy=%.9f span=%.8f path=%s mism=%d max=%d it=%d rsp_ms=%lld fps1000=%lld btn=%04X conn=%d fly=%d name=%s keys=%d morph=%d mm0=%d/%d/%d/%d\n",
+                "[probe] f=%ld cx=%.9f cy=%.9f span=%.8f path=%s mism=%d max=%d it=%d rsp_ms=%lld deep_us=%lld fps1000=%lld btn=%04X conn=%d fly=%d name=%s keys=%d morph=%d mm0=%d/%d/%d/%d\n",
                 (long)frame, cx0, cy0, span, use_rsp ? "rsp" : "cpu",
                 mismatch, maxc, iters,
-                (long long)(us_rsp / 1000), fps_milli, jin.btn.raw,
+                (long long)(us_rsp / 1000), us_deep, fps_milli, jin.btn.raw,
                 (int)joypad_is_connected(JOYPAD_PORT_1), fly_active, view_name,
                 ring_n, morphed,
                 mm_y[0], mm_x[0], mm_v[0], mm_r[0]);
