@@ -148,7 +148,9 @@ static int  ring_n = 0;
 /* stage P hold-upgrade: first deep frame per bucket renders quarter-res
    (fast); once the view holds still for HOLD_FRAMES, one full-res CPU
    render upgrades that bucket's key to full quality (fq=1). */
+#ifndef HOLD_FRAMES
 #define HOLD_FRAMES 3
+#endif
 static double hold_cx = 0, hold_cy = 0, hold_span = -1;
 static int    hold_n = 0;
 
