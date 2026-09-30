@@ -265,11 +265,49 @@ static void ring_morph(uint32_t *out, double cx, double cy, double span, int ia,
     (void)dy;
 }
 
+/* stage Q: perturbation deep zoom. Below PERT_SPAN the absolute c-grid
+   (x0+dx*x) collapses into shared doubles (ulp(cx) ~ 1.1e-16), so the deep
+   pass switches to delta iteration z = R + d around a double reference
+   orbit R at the view center. Pixel offsets stay SPAN-RELATIVE
+   (dx*(x-W/2)), which keeps full column structure at any representable
+   span — host harness perturb2.py measured 100% pattern+iter fidelity vs
+   Decimal oracle through 1e-30 with plain doubles and no renorm needed. */
+#ifndef PERT_SPAN
+#define PERT_SPAN 1e-13
+#endif
+#ifndef ITMAX
+#define ITMAX 1200
+#endif
+/* perturbed path is iteration-cheap (delta math) and deep windows need far
+   more iterations to resolve structure; reference coords that bail before
+   this are cut off by pr_esc (see pert_ref) */
+#ifndef PERT_ITMAX
+#define PERT_ITMAX 4600
+#endif
+static double rr_x[(ITMAX > PERT_ITMAX ? ITMAX : PERT_ITMAX) + 1];
+static double rr_y[(ITMAX > PERT_ITMAX ? ITMAX : PERT_ITMAX) + 1];
+static double pr_cx = 1e30, pr_cy = 1e30;
+static int    pr_it = -1;
+static int    pr_esc = 0;   /* iter where ref orbit bailed (0 = bounded) */
+
+static void pert_ref(double cx, double cy, int iters)
+{
+    if (cx == pr_cx && cy == pr_cy && iters == pr_it) return;
+    pr_cx = cx; pr_cy = cy; pr_it = iters;
+    rr_x[0] = 0.0; rr_y[0] = 0.0;
+    for (int k = 0; k < iters; k++) {
+        double x = rr_x[k], y = rr_y[k];
+        rr_x[k + 1] = x * x - y * y + cx;
+        rr_y[k + 1] = 2.0 * x * y + cy;
+    }
+}
+
 typedef struct { double cx, cy, span; const char *name; } Preset;
 static const Preset presets[] = {
     { -0.700000,          0.000000,         2.6,   "HOME" },
     { -0.745800,         -0.114900,         0.02,  "SEAHORSE" },
     { -0.7436438870371,   0.1318259042053, 5e-5,  "TAIL" },
+    { -0.74364388703715867,  0.13182590420531198, 5e-15, "DEEP-Q" },
     { -0.745000,         -0.115000,         0.30,  "VALLEY" },
 };
 #define NPRESET ((int)(sizeof(presets)/sizeof(presets[0])))
@@ -491,7 +529,19 @@ int main(void)
     /* interactive view state (stage H): auto=1 → zoom tour, auto=0 → pad */
     int auto_mode = 1;
     double vcx = keys[0].cx, vcy = keys[0].cy, vspan = keys[0].span;
+#ifdef PERT_TEST
+    /* boot parked in the perturbation regime (manual, no fly).
+       Wiki seahorse-valley coord: reference bounded through ~7986 iters
+       (ITMAX=4000 is safe); ulp(cx)=1.11e-16 so at span 5e-15 the direct
+       c-grid has only ~45 distinct columns for 320 px -> heavy banding,
+       while the true window still has 18% interior structure. */
+    vcx = -0.743643887037158704752191506114774; vcy = 0.13182590420531197049313205638514; vspan = 5e-15;
+    auto_mode = 0;
+#endif
     int pad_active = 0, pad_inactive_frames = 0;
+#ifdef PERT_TEST
+    pad_active = 1;
+#endif
 
     printf("[n64] mandel stage-E boot: %dx%d zoom tour NKEY=%d verify=%d\n",
            W, H, NKEY, VERIFY);
@@ -503,6 +553,7 @@ int main(void)
         /* ---- stage H: controller input ---- */
         joypad_inputs_t jin = joypad_get_inputs(JOYPAD_PORT_1);
 #ifdef AUTOTEST
+#ifndef PERT_TEST
         /* scripted input for headless verification (SI not polled in fork
            headless JS runner): cycle presets through the same fly path */
         {
@@ -513,6 +564,7 @@ int main(void)
                 fly_req = (slot < NPRESET) ? slot : -2;   /* -2 = Start */
             }
         }
+#endif
 #endif
         int sx = jin.stick_x, sy = jin.stick_y;
         if (sx > -7 && sx < 7) sx = 0;            /* stick deadzone */
@@ -611,7 +663,7 @@ int main(void)
             vcx += mx * pan_scale;
             vcy += my * pan_scale;
             vspan *= zoomf;
-            if (vspan < 5e-5) vspan = 5e-5;
+            if (vspan < 1e-16) vspan = 1e-16;
             if (vspan > 4.0)  vspan = 4.0;
             cx0 = vcx; cy0 = vcy; span = vspan;
         }
@@ -631,9 +683,12 @@ int main(void)
 #if USE_RSP
         use_rsp = span >= RSP_MIN_SPAN;
 #endif
-        int iters = (int)(60.0 + 90.0 * log2(2.6 / (span < 1e-9 ? 1e-9 : span)));
+        /* perturbation regime decided before the cap: deep passes use the
+           higher PERT_ITMAX budget (delta math is cheap per iteration) */
+        int pert = (span < PERT_SPAN);
+        int iters = (int)(60.0 + 90.0 * log2(2.6 / (span < 1e-16 ? 1e-16 : span)));
         if (iters < MAXITER) iters = MAXITER;
-        if (iters > 1200) iters = 1200;
+        if (iters > (pert ? PERT_ITMAX : ITMAX)) iters = (pert ? PERT_ITMAX : ITMAX);
 
         int rowmax = H, mirror = 0;
         int mismatch = 0, maxc = 0;
@@ -727,15 +782,40 @@ int main(void)
                once held, one full-res render upgrades the bucket key
                (fq=1) and refreshes the static cache. */
             int fullq = (hold_n >= HOLD_FRAMES);
+            if (pert) {
+                pert_ref(cx0, cy0, iters);
+                /* reference bailed at pr_esc: pixels can't be meaningfully
+                   iterated past it — clamp so a bad ref coord degrades to
+                   the ref-escape bound instead of painting orbit garbage */
+                if (pr_esc && pr_esc < iters) iters = pr_esc;
+            }
             if (fullq) {
                 /* full-res CPU pass: upgrade rows_cnt + fq ring key */
                 for (int y = 0; y < H; y++) {
                     double ci = y0 + dy * y;
                     double ci2 = ci * ci;
+                    double cdy = dy * (y - H / 2);      /* span-relative */
                     for (int x = 0; x < W; x++) {
                         double cr = x0 + dx * x;
                         double zr = 0, zi = 0, S = 0;
                         int cnt = iters;
+                        if (pert) {
+                            double cdx = dx * (x - W / 2);
+                            double drx = 0, dri = 0;
+                            for (int k = 0; k < iters; k++) {
+                                double tx = 2.0 * rr_x[k] + drx;
+                                double ty = 2.0 * rr_y[k] + dri;
+                                /* complex: d' = (2R+d)*d + dC */
+                                double nx = tx * drx - ty * dri + cdx;
+                                double ny = tx * dri + ty * drx + cdy;
+                                drx = nx; dri = ny;
+                                double zx = rr_x[k + 1] + drx;
+                                double zy = rr_y[k + 1] + dri;
+                                S = zx * zx + zy * zy;
+                                if (S >= 4.0) { cnt = k + 1; break; }
+                            }
+                        }
+                        if (!pert) {
 #if !defined(NO_L1)
                         double crm = cr - 0.25;
                         double q = crm * crm + ci2;
@@ -757,6 +837,7 @@ int main(void)
                                 zr = t + cr;
                             }
                         }
+                        }
                         if (cnt > maxc) maxc = cnt;
                         int s8 = (int)(S * 1024.0);
                         rows_cnt[y][x] = (uint16_t)cnt;
@@ -768,10 +849,27 @@ int main(void)
                 for (int qy = 0; qy < QH; qy++) {
                     double ci = y0 + dy * (qy * 4);
                     double ci2 = ci * ci;
+                    double cdy = dy * (qy * 4 - H / 2);
                     for (int qx = 0; qx < QW; qx++) {
                         double cr = x0 + dx * (qx * 4);
                         double zr = 0, zi = 0, S = 0;
                         int cnt = iters;
+                        if (pert) {
+                            double cdx = dx * (qx * 4 - W / 2);
+                            double drx = 0, dri = 0;
+                            for (int k = 0; k < iters; k++) {
+                                double tx = 2.0 * rr_x[k] + drx;
+                                double ty = 2.0 * rr_y[k] + dri;
+                                double nx = tx * drx - ty * dri + cdx;
+                                double ny = tx * dri + ty * drx + cdy;
+                                drx = nx; dri = ny;
+                                double zx = rr_x[k + 1] + drx;
+                                double zy = rr_y[k + 1] + dri;
+                                S = zx * zx + zy * zy;
+                                if (S >= 4.0) { cnt = k + 1; break; }
+                            }
+                        }
+                        if (!pert) {
 #if !defined(NO_L1)
                         double crm = cr - 0.25;
                         double q = crm * crm + ci2;
@@ -792,6 +890,7 @@ int main(void)
                                 zi = 2.0 * zr * zi + ci;
                                 zr = t + cr;
                             }
+                        }
                         }
                         if (cnt > maxc) maxc = cnt;
                         int s8 = (int)(S * 1024.0);
@@ -913,8 +1012,9 @@ int main(void)
         ) {
             char line[256];
             int n = snprintf(line, sizeof(line),
-                "[probe] f=%ld cx=%.9f cy=%.9f span=%.8f path=%s mism=%d max=%d it=%d rsp_ms=%lld deep_us=%lld fps1000=%lld btn=%04X conn=%d fly=%d name=%s keys=%d morph=%d mm0=%d/%d/%d/%d\n",
+                "[probe] f=%ld cx=%.17g cy=%.17g span=%.4e path=%s pert=%d mism=%d max=%d it=%d rsp_ms=%lld deep_us=%lld fps1000=%lld btn=%04X conn=%d fly=%d name=%s keys=%d morph=%d mm0=%d/%d/%d/%d\n",
                 (long)frame, cx0, cy0, span, use_rsp ? "rsp" : "cpu",
+                (int)(span < PERT_SPAN),
                 mismatch, maxc, iters,
                 (long long)(us_rsp / 1000), us_deep, fps_milli, jin.btn.raw,
                 (int)joypad_is_connected(JOYPAD_PORT_1), fly_active, view_name,
