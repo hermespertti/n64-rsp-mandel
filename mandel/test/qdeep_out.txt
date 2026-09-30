@@ -1,0 +1,6 @@
+K=22 WB=1.99: escape-exact 25581/76800 (33.31%)  viol={'acc': 0, 'h16': 0, 'm16': 0}
+          S dev max(dbl-units): 21.460665  frac>0.01: 99.966%
+K=22 WB=1.2: escape-exact 25581/76800 (33.31%)  viol={'acc': 0, 'h16': 0, 'm16': 0}
+          S dev max(dbl-units): 21.460665  frac>0.01: 100.000%
+K=23 WB=0.99: escape-exact 28324/76800 (36.88%)  viol={'acc': 0, 'h16': 0, 'm16': 0}
+          S dev max(dbl-units): 21.518918  frac>0.01: 100.000%
