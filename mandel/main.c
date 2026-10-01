@@ -321,6 +321,10 @@ static int  book_slot = 0;
 /* stage M: palette cycling — hue phase drift folded into smooth lookup */
 static int pal_phase = 0;        /* added to smooth_color idx */
 static int cycle_on = 1;
+/* stage R: palette name flash + screensaver + preset carousel slot */
+static int pal_blink = 0;
+static int screensaver = 0;
+static int preset_slot = 0;
 static int book_blink = 0;       /* HUD blink frames after save/recall */
 static long long hud_tprev = 0;  /* fps EMA state */
 static long long hud_fps = 60000;/* fps * 1000, EMA over frame times */
@@ -393,16 +397,36 @@ static void build_smooth_tab(void)
     }
 }
 
+/* stage R: cosine palette sets (IQ style: a + b*cos(2pi(ct+d))) */
+#define NPS 6
+static const char *pal_names[NPS] = { "RAINBOW", "ULTRA", "GRAY", "FIRE", "ICE", "VOLT" };
+static const double pal_par[NPS][4][4] = {
+  /* a(r,g,b,_)  b(...)  c(...)  d(...) */
+  { {0.5,0.5,0.5,0}, {0.5,0.5,0.5,0}, {1,1,1,1},     {0.00,0.33,0.67,0} }, /* RAINBOW */
+  { {0.55,0.45,0.35,0},{0.45,0.45,0.45,0},{1,1,1,1}, {0.00,0.10,0.20,0} }, /* ULTRA   */
+  { {0.5,0.5,0.5,0}, {0.5,0.5,0.5,0}, {1,1,1,1},     {0.00,0.00,0.00,0} }, /* GRAY    */
+  { {0.50,0.30,0.18,0},{0.50,0.35,0.20,0},{1,1,1,1}, {0.00,0.11,0.22,0} }, /* FIRE    */
+  { {0.32,0.50,0.62,0},{0.30,0.38,0.38,0},{1,1,1,1}, {0.58,0.62,0.70,0} }, /* ICE     */
+  { {0.50,0.45,0.55,0},{0.50,0.50,0.50,0},{2,2,2,2}, {0.00,0.15,0.35,0} }, /* VOLT    */
+};
+static int pal_set = 0;
+
 static void build_palette(void)
 {
+    const double (*P)[4] = pal_par[pal_set];
     for (int i = 0; i < PALN; i++) {
         double t = (double)i / PALN;
-        double r = 0.5 + 0.5 * sin(6.28318530718 * (t + 0.00));
-        double g = 0.5 + 0.5 * sin(6.28318530718 * (t + 0.33));
-        double b = 0.5 + 0.5 * sin(6.28318530718 * (t + 0.67));
-        pal_lut[i] = color_to_packed32(RGBA32((uint8_t)(r * 255),
-                                               (uint8_t)(g * 255),
-                                               (uint8_t)(b * 255), 255));
+        double rgb[3];
+        for (int k = 0; k < 3; k++) {
+            double v = P[0][k] + P[1][k] *
+                cos(6.28318530718 * (P[2][k] * t + P[3][k]));
+            rgb[k] = v < 0 ? 0 : (v > 1 ? 1 : v);
+        }
+        if (pal_set == 2) /* GRAY: apply gamma ramp */
+            for (int k = 0; k < 3; k++) rgb[k] = rgb[k] * rgb[k];
+        pal_lut[i] = color_to_packed32(RGBA32((uint8_t)(rgb[0] * 255),
+                                               (uint8_t)(rgb[1] * 255),
+                                               (uint8_t)(rgb[2] * 255), 255));
     }
 }
 
@@ -579,18 +603,34 @@ int main(void)
         else if (fly_req == -2) { auto_mode = 1; pad_active = 0; fly_active = 0; fly_req = -1; }
 #endif
         int any_btn = jin.btn.a || jin.btn.b || jin.btn.z || jin.btn.l ||
-                      jin.btn.r || jin.btn.start;
+                      jin.btn.r || jin.btn.start || jin.btn.c_up ||
+                      jin.btn.c_down || jin.btn.c_left || jin.btn.c_right;
         if (sx || sy || bx || by || any_btn) pad_inactive_frames = 0;
-        else if (pad_active) pad_inactive_frames++;
+        else pad_inactive_frames++;
         if (jin.btn.start) { auto_mode = 1; pad_active = 0; fly_active = 0; }
-        /* C-buttons: fly to presets */
+        /* stage R: C-left/C-right cycle palette sets (ring rebuild cheap:
+           4096 cos * 3 — one-time ~1ms); C-up/down fly presets */
+        {
+            static int prev_cl = 0, prev_cr = 0;
+            if (jin.btn.c_left && !prev_cl) {
+                pal_set = (pal_set + NPS - 1) % NPS; build_palette();
+                pal_blink = 90;
+            }
+            if (jin.btn.c_right && !prev_cr) {
+                pal_set = (pal_set + 1) % NPS; build_palette();
+                pal_blink = 90;
+            }
+            prev_cl = jin.btn.c_left; prev_cr = jin.btn.c_right;
+        }
+        /* C-buttons up/down: fly to presets 0..3 (R triggers wrap around) */
         {
             int pidx = -1;
-            if (jin.btn.c_up)    pidx = 0;
-            if (jin.btn.c_right) pidx = 1;
-            if (jin.btn.c_down)  pidx = 2;
-            if (jin.btn.c_left)  pidx = 3;
+            static int prev_cu = 0, prev_cd = 0;
+            if (jin.btn.c_up && !prev_cu)   pidx = (preset_slot + 1) % NPRESET;
+            if (jin.btn.c_down && !prev_cd) pidx = (preset_slot + NPRESET - 1) % NPRESET;
+            prev_cu = jin.btn.c_up; prev_cd = jin.btn.c_down;
             if (pidx >= 0) {
+                preset_slot = pidx;
                 fly_active = 1;
                 f_cx = presets[pidx].cx; f_cy = presets[pidx].cy;
                 f_span = presets[pidx].span;
@@ -629,6 +669,23 @@ int main(void)
         int lr = jin.btn.l && jin.btn.r;
         if (lr && !prev_lr) cycle_on = !cycle_on;
         prev_z = jin.btn.z; prev_a = jin.btn.a; prev_lr = lr;
+        /* stage R: any stick/button input wakes the screensaver */
+        if (screensaver && (sx || sy || bx || by || any_btn)) {
+            screensaver = 0; pad_inactive_frames = 0; pad_active = 1;
+        }
+#ifndef IDLE_FRAMES
+#define IDLE_FRAMES 1800        /* ~30 s of no pad input -> screensaver */
+#endif
+        if (!screensaver && pad_inactive_frames > IDLE_FRAMES) {
+            /* stage R: screensaver — auto tour + auto palette carousel */
+            screensaver = 1; auto_mode = 1; pad_active = 0; fly_active = 0;
+        }
+#ifndef PALROT
+#define PALROT 600              /* screensaver palette swap every N frames */
+#endif
+        if (screensaver && (frame % PALROT) == 0) {
+            pal_set = (pal_set + 1) % NPS; build_palette();
+        }
 #ifndef PERT_TEST
         if (pad_active && pad_inactive_frames > 300) { auto_mode = 1; pad_active = 0; }
 #endif
@@ -961,6 +1018,7 @@ int main(void)
         /* ---- HUD ---- */
         if (cycle_on) pal_phase = (pal_phase + 3) & (PALN - 1);
         if (book_blink > 0) book_blink--;
+        if (pal_blink > 0) pal_blink--;
         /* fps: EMA over real elapsed ticks (2 ms granularity timer) */
         long long now = timer_ticks();
         long long dt_us = TIMER_MICROS_LL(now - hud_tprev);
@@ -978,10 +1036,11 @@ int main(void)
             snprintf(l1, sizeof(l1), "MANDEL 64  %s", view_name);
             snprintf(l2, sizeof(l2), "X%s Y%s SPAN %s %s IT%d",
                      xs, ys, sp, use_rsp ? "RSP" : "CPU", iters);
-            snprintf(l3, sizeof(l3), "%dFPS  %s CYC%d BK%d",
+            snprintf(l3, sizeof(l3), "%dFPS  %s %s%s BK%d",
                      (int)(hud_fps / 1000),
                      morphed ? "MORPH" : "RENDER",
-                     cycle_on, book_slot);
+                     (pal_blink > 0 || screensaver) ? pal_names[pal_set] : "CYC",
+                     screensaver ? "ZZ" : "", book_slot);
             uint32_t cblack = color_to_packed32(RGBA32(0, 0, 0, 255));
             uint32_t cwhite = color_to_packed32(RGBA32(255, 255, 255, 255));
             uint32_t cteal  = color_to_packed32(RGBA32(0, 255, 170, 255));
@@ -1014,13 +1073,13 @@ int main(void)
         ) {
             char line[256];
             int n = snprintf(line, sizeof(line),
-                "[probe] f=%ld cx=%.17g cy=%.17g span=%.4e path=%s pert=%d mism=%d max=%d it=%d rsp_ms=%lld deep_us=%lld fps1000=%lld btn=%04X conn=%d fly=%d name=%s keys=%d morph=%d mm0=%d/%d/%d/%d\n",
+                "[probe] f=%ld cx=%.17g cy=%.17g span=%.4e path=%s pert=%d mism=%d max=%d it=%d rsp_ms=%lld deep_us=%lld fps1000=%lld btn=%04X conn=%d fly=%d name=%s keys=%d morph=%d ps=%d ss=%d mm0=%d/%d/%d/%d\n",
                 (long)frame, cx0, cy0, span, use_rsp ? "rsp" : "cpu",
                 (int)(span < PERT_SPAN),
                 mismatch, maxc, iters,
                 (long long)(us_rsp / 1000), us_deep, fps_milli, jin.btn.raw,
                 (int)joypad_is_connected(JOYPAD_PORT_1), fly_active, view_name,
-                ring_n, morphed,
+                ring_n, morphed, pal_set, screensaver,
                 mm_y[0], mm_x[0], mm_v[0], mm_r[0]);
             static uint8_t isvbuf[256] __attribute__((aligned(8)));
             for (int i = 0; i < n; i++) isvbuf[i] = (uint8_t)line[i];
