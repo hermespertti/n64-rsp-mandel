@@ -4,3 +4,5 @@ mandel/build/
 *.o
 .cache/
 *.log
+*.mp4
+__pycache__/
