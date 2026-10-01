@@ -152,6 +152,7 @@ static int  ring_n = 0;
 #define HOLD_FRAMES 3
 #endif
 static double hold_cx = 0, hold_cy = 0, hold_span = -1;
+static double hold_cxl = 0, hold_cyl = 0;   /* stage S: DD-aware cache key */
 static int    hold_n = 0;
 
 /* stage P static caching: deep frames recompute only when the view moves;
@@ -275,6 +276,15 @@ static void ring_morph(uint32_t *out, double cx, double cy, double span, int ia,
 #ifndef PERT_SPAN
 #define PERT_SPAN 1e-13
 #endif
+/* stage S: below this span the view center switches to DD (hi+lo) so both
+   the center AND the reference orbit keep resolution under ulp(cx) */
+#ifndef DD_SPAN
+#define DD_SPAN 2.5e-16
+#endif
+#ifndef DD_ITMAX
+#define DD_ITMAX 7500   /* structure at 1e-16 wiki-seahorse escapes ~7000 */
+#endif
+#define DD_ITERS DD_ITMAX
 #ifndef ITMAX
 #define ITMAX 1200
 #endif
@@ -284,37 +294,108 @@ static void ring_morph(uint32_t *out, double cx, double cy, double span, int ia,
 #ifndef PERT_ITMAX
 #define PERT_ITMAX 4600
 #endif
-static double rr_x[(ITMAX > PERT_ITMAX ? ITMAX : PERT_ITMAX) + 1];
-static double rr_y[(ITMAX > PERT_ITMAX ? ITMAX : PERT_ITMAX) + 1];
+#define RR_N ((DD_ITMAX > PERT_ITMAX ? DD_ITMAX : PERT_ITMAX) + 1)
+static double rr_x[RR_N];
+static double rr_y[RR_N];
+static double rr_xl[RR_N];  /* stage S: DD lo */
+static double rr_yl[RR_N];
 static double pr_cx = 1e30, pr_cy = 1e30;
+static int    pr_nodd = 1;   /* cached ref orbit came from plain pert_ref */
 static int    pr_it = -1;
 static int    pr_esc = 0;   /* iter where ref orbit bailed (0 = bounded) */
+static double pr_cxl = 0.0, pr_cyl = 0.0;   /* DD lo words of ref center */
 
+/* double-double two-sum: s = a+b exact split, e = rounding error */
+static inline void twosum(double a, double b, double *s, double *e)
+{
+    double t = a + b;
+    double bb = t - a;
+    *s = t;
+    *e = (a - (t - bb)) + (b - bb);
+}
+static inline double twosum_(double a, double b, double *e)
+{
+    double s; twosum(a, b, &s, e); return s;
+}
+/* stage S: double-double view center — hi+lo pair lets the view live below
+   ulp(cx)~1.1e-16; pans accumulate exactly into lo */
+static double vcx_lo = 0.0, vcy_lo = 0.0;   /* low words of view center */
+
+/* Dekker split multiply: p + e = a*b exactly (no FMA on R4300, safe) */
+static inline void two_prod(double a, double b, double *p, double *e)
+{
+    const double SPLIT = 134217729.0;   /* 2^27+1 */
+    *p = a * b;
+    double t = a * SPLIT; double ah = t - (t - a); double al = a - ah;
+    t = b * SPLIT;        double bh = t - (t - b); double bl = b - bh;
+    *e = ((ah * bh - *p) + ah * bl + al * bh) - al * bl;
+}
+
+/* plain-double ref for the PERT regime (below double grid, above DD wall);
+   lo words zeroed so the single DD-exact delta loop degrades to it exactly */
 static void pert_ref(double cx, double cy, int iters)
 {
-    if (cx == pr_cx && cy == pr_cy && iters == pr_it) return;
-    pr_cx = cx; pr_cy = cy; pr_it = iters;
-    rr_x[0] = 0.0; rr_y[0] = 0.0;
+    if (cx == pr_cx && pr_nodd && cy == pr_cy && iters == pr_it) return;
+    pr_cx = cx; pr_cy = cy; pr_it = iters; pr_nodd = 1;
+    rr_x[0] = 0.0; rr_y[0] = 0.0; rr_xl[0] = 0.0; rr_yl[0] = 0.0;
+    pr_esc = 0;
     for (int k = 0; k < iters; k++) {
         double x = rr_x[k], y = rr_y[k];
         rr_x[k + 1] = x * x - y * y + cx;
         rr_y[k + 1] = 2.0 * x * y + cy;
+        rr_xl[k + 1] = 0.0; rr_yl[k + 1] = 0.0;
+        if (!pr_esc && rr_x[k + 1] * rr_x[k + 1] + rr_y[k + 1] * rr_y[k + 1] >= 4.0)
+            pr_esc = k + 1;
     }
 }
 
-typedef struct { double cx, cy, span; const char *name; } Preset;
+static void pert_ref_dd(double cx, double cxl, double cy, double cyl, int iters)
+{
+    if (cx == pr_cx && cxl == pr_cxl && cy == pr_cy && cyl == pr_cyl &&
+        iters == pr_it)
+        return;
+    pr_cx = cx; pr_cxl = cxl; pr_cy = cy; pr_cyl = cyl; pr_it = iters;
+    pr_nodd = 0;
+    double rh = 0, rl = 0, ih = 0, il = 0;
+    rr_x[0] = 0.0; rr_y[0] = 0.0; rr_xl[0] = 0.0; rr_yl[0] = 0.0;
+    pr_esc = 0;
+    for (int k = 0; k < iters; k++) {
+        double ar, br, ai, bi, xr, xl, h, e, s2, e2;
+        double orh = rh, orl = rl, oih = ih, oil = il;   /* snapshot */
+        two_prod(orh, orh, &ar, &br); br += 2.0 * orh * orl;
+        two_prod(oih, oih, &ai, &bi); bi += 2.0 * oih * oil;
+        two_prod(orh, oih, &xr, &xl);
+        /* real: rh^2 - ih^2 + cx (+ all low words) */
+        twosum(ar, -ai, &s2, &e2);  e = e2 + br - bi;
+        twosum(s2, cx, &h, &e2);    e += e2 + cxl;
+        twosum(h, e, &rh, &rl);
+        /* imag: 2*rh*ih + cy (+ low words incl. cross terms) */
+        twosum(2.0 * xr, 2.0 * xl, &s2, &e2);
+        e = e2 + 2.0 * (orh * oil + orl * oih);
+        twosum(s2, cy, &h, &e2);    e += e2 + cyl;
+        twosum(h, e, &ih, &il);
+        rr_x[k + 1] = rh; rr_xl[k + 1] = rl;
+        rr_y[k + 1] = ih; rr_yl[k + 1] = il;
+        if (!pr_esc && rh * rh + ih * ih >= 4.0) pr_esc = k + 1;
+    }
+}
+
+typedef struct { double cx, cxl, cy, cyl, span; const char *name; } Preset;
 static const Preset presets[] = {
-    { -0.700000,          0.000000,         2.6,   "HOME" },
-    { -0.745800,         -0.114900,         0.02,  "SEAHORSE" },
-    { -0.7436438870371,   0.1318259042053, 5e-5,  "TAIL" },
-    { -0.74364388703715867,  0.13182590420531198, 5e-15, "DEEP-Q" },
-    { -0.745000,         -0.115000,         0.30,  "VALLEY" },
+    { -0.700000, 0, 0.000000, 0, 2.6,   "HOME" },
+    { -0.745800, 0, -0.114900, 0, 0.02,  "SEAHORSE" },
+    { -0.7436438870371, 0, 0.1318259042053, 0, 5e-5, "TAIL" },
+    { -0.74364388703715867, -4.75219150611477397e-18,
+      0.13182590420531198, -9.50686794361486031e-18, 5e-15, "DEEP-Q" },
+    { -0.74364388703715867, -4.75219150611477397e-18,
+      0.13182590420531198, -9.50686794361486031e-18, 1e-16, "DD-Q" },
+    { -0.745000, 0, -0.115000, 0, 0.30,  "VALLEY" },
 };
 #define NPRESET ((int)(sizeof(presets)/sizeof(presets[0])))
 
 /* stage M: user bookmarks — save current view on X, fly with ZL */
 #define NBOOK 8
-typedef struct { double cx, cy, span; int valid; } Book;
+typedef struct { double cx, cxl, cy, cyl, span; int valid; } Book;
 static Book books[NBOOK] = { {0} };
 static int  book_slot = 0;
 
@@ -331,6 +412,7 @@ static long long hud_fps = 60000;/* fps * 1000, EMA over frame times */
 
 static int   fly_active = 0;
 static double f_cx, f_cy, f_span;
+static double f_cxl, f_cyl;   /* stage S: DD lo of fly target */
 static const char *fly_name = "PRESET";
 #ifdef AUTOTEST
 static int fly_req = -1;
@@ -410,6 +492,8 @@ static const double pal_par[NPS][4][4] = {
   { {0.50,0.45,0.55,0},{0.50,0.50,0.50,0},{2,2,2,2}, {0.00,0.15,0.35,0} }, /* VOLT    */
 };
 static int pal_set = 0;
+
+/* stage S: vcx_lo/vcy_lo declared with twosum near pert_ref */
 
 static void build_palette(void)
 {
@@ -560,6 +644,13 @@ int main(void)
        c-grid has only ~45 distinct columns for 320 px -> heavy banding,
        while the true window still has 18% interior structure. */
     vcx = -0.743643887037158704752191506114774; vcy = 0.13182590420531197049313205638514; vspan = 5e-15;
+    /* stage S: hi+lo split; lo precomputed in exact decimal (a literal
+       would round to the same double as vcx and cancel to zero) */
+    vcx_lo = -4.75219150611477397282e-18;
+    vcy_lo = -9.50686794361486031255e-18;
+#ifdef DDTEST_SPAN
+    vspan = DDTEST_SPAN;
+#endif
     auto_mode = 0;
 #endif
     int pad_active = 0, pad_inactive_frames = 0;
@@ -597,7 +688,8 @@ int main(void)
         int by = (int)jin.btn.d_down - (int)jin.btn.d_up;
 #ifdef AUTOTEST
         if (fly_req >= 0) { int pidx = fly_req; fly_active = 1;
-            f_cx = presets[pidx].cx; f_cy = presets[pidx].cy;
+            f_cx = presets[pidx].cx; f_cxl = presets[pidx].cxl;
+            f_cy = presets[pidx].cy; f_cyl = presets[pidx].cyl;
             f_span = presets[pidx].span; fly_name = presets[pidx].name;
             auto_mode = 0; pad_active = 1; fly_req = -1; }
         else if (fly_req == -2) { auto_mode = 1; pad_active = 0; fly_active = 0; fly_req = -1; }
@@ -632,7 +724,8 @@ int main(void)
             if (pidx >= 0) {
                 preset_slot = pidx;
                 fly_active = 1;
-                f_cx = presets[pidx].cx; f_cy = presets[pidx].cy;
+                f_cx = presets[pidx].cx; f_cxl = presets[pidx].cxl;
+                f_cy = presets[pidx].cy; f_cyl = presets[pidx].cyl;
                 f_span = presets[pidx].span;
                 fly_name = presets[pidx].name;
                 auto_mode = 0; pad_active = 1;
@@ -649,7 +742,8 @@ int main(void)
         /* stage M: Z save bookmark, A recall, L+R palette cycle toggle */
         static int prev_z = 0, prev_a = 0, prev_lr = 0;
         if (jin.btn.z && !prev_z) {
-            books[book_slot].cx = vcx; books[book_slot].cy = vcy;
+            books[book_slot].cx = vcx; books[book_slot].cxl = vcx_lo;
+            books[book_slot].cy = vcy; books[book_slot].cyl = vcy_lo;
             books[book_slot].span = vspan; books[book_slot].valid = 1;
             book_slot = (book_slot + 1) % NBOOK;
             book_blink = 90;
@@ -660,7 +754,9 @@ int main(void)
                 if (books[i].valid) { s = i; break; }
             if (s >= 0) {
                 fly_active = 1;
-                f_cx = books[s].cx; f_cy = books[s].cy; f_span = books[s].span;
+                f_cx = books[s].cx; f_cxl = books[s].cxl;
+                f_cy = books[s].cy; f_cyl = books[s].cyl;
+                f_span = books[s].span;
                 fly_name = "BOOKMARK";
                 auto_mode = 0; pad_active = 1;
                 book_blink = 90;
@@ -695,17 +791,20 @@ int main(void)
         if (auto_mode) {
             view_at(frame, &cx0, &cy0, &span);
             vcx = cx0; vcy = cy0; vspan = span;
+            vcx_lo = vcy_lo = 0.0;
             view_name = "TOUR";
         } else if (fly_active) {
             /* exponential ease toward preset; geometric span glide */
             double e = 0.06;
             vcx += (f_cx - vcx) * e;
             vcy += (f_cy - vcy) * e;
+            vcx_lo = vcy_lo = 0.0;   /* mid-flight lo is meaningless */
             double ls = log(vspan), ln = log(f_span);
             vspan = exp(ls + (ln - ls) * e);
             if (fabs(vspan - f_span) < f_span * 1e-4 &&
                 fabs(vcx - f_cx) < 1e-9 && fabs(vcy - f_cy) < 1e-9) {
                 vcx = f_cx; vcy = f_cy; vspan = f_span;
+                vcx_lo = f_cxl; vcy_lo = f_cyl;
                 fly_active = 0;
             }
             cx0 = vcx; cy0 = vcy; span = vspan;
@@ -716,13 +815,18 @@ int main(void)
             /* stage M: ZR zoom in, ZL zoom out (C-buttons keep preset fly) */
             if (jin.btn.r) zoomf = 0.94;                     /* ZR */
             if (jin.btn.l) zoomf = 1.06;                     /* ZL */
+            /* pan in DD: add delta to hi, carry rounding error into lo */
+            double s_, e_;
             double pan_scale = vspan / 900.0;
             double mx = (sx ? (double)sx : (double)bx * 60.0);
             double my = (sy ? -(double)sy : (double)by * 60.0); /* stick up = -imag */
-            vcx += mx * pan_scale;
-            vcy += my * pan_scale;
+            /* stage S: DD-exact pan — lo accumulates every lost bit */
+            twosum(vcx, mx * pan_scale, &s_, &e_);
+            vcx = s_; twosum(vcx_lo, e_, &s_, &e_); vcx_lo = s_;
+            twosum(vcy, my * pan_scale, &s_, &e_);
+            vcy = s_; twosum(vcy_lo, e_, &s_, &e_); vcy_lo = s_;
             vspan *= zoomf;
-            if (vspan < 1e-16) vspan = 1e-16;
+            if (vspan < 1e-18) vspan = 1e-18;
             if (vspan > 4.0)  vspan = 4.0;
             cx0 = vcx; cy0 = vcy; span = vspan;
         }
@@ -745,9 +849,15 @@ int main(void)
         /* perturbation regime decided before the cap: deep passes use the
            higher PERT_ITMAX budget (delta math is cheap per iteration) */
         int pert = (span < PERT_SPAN);
+        /* stage S: below double-ulp of the center (~1.1e-16) the absolute c
+           grid is dead; DD center path takes over strictly under DD_SPAN so
+           the CI-verified 1e-13..2e-16 regime stays bit-identical */
+        int dd = (span < DD_SPAN);
         int iters = (int)(60.0 + 90.0 * log2(2.6 / (span < 1e-16 ? 1e-16 : span)));
+        if (dd) iters = DD_ITERS;   /* structure at DD depth sits past 4600 */
         if (iters < MAXITER) iters = MAXITER;
-        if (iters > (pert ? PERT_ITMAX : ITMAX)) iters = (pert ? PERT_ITMAX : ITMAX);
+        if (iters > (dd ? DD_ITMAX : (pert ? PERT_ITMAX : ITMAX)))
+            iters = (dd ? DD_ITMAX : (pert ? PERT_ITMAX : ITMAX));
 
         int rowmax = H, mirror = 0;
         int mismatch = 0, maxc = 0;
@@ -809,8 +919,12 @@ int main(void)
 
         int morphed = 0, qpainted = 0;
         /* stage P hold tracker: same view spans consecutive frames */
-        if (cx0 == hold_cx && cy0 == hold_cy && span == hold_span) hold_n++;
-        else { hold_cx = cx0; hold_cy = cy0; hold_span = span; hold_n = 1; }
+        if (cx0 == hold_cx && cy0 == hold_cy && span == hold_span &&
+            ((cx0 != vcx) || (vcx_lo == hold_cxl && vcy_lo == hold_cyl))) hold_n++;
+        else { hold_cx = cx0; hold_cy = cy0; hold_span = span;
+               hold_cxl = (cx0 == vcx) ? vcx_lo : 0.0;
+               hold_cyl = (cy0 == vcy) ? vcy_lo : 0.0;
+               hold_n = 1; }
         if (use_rsp) hold_valid = 0;
         if (!use_rsp && hold_valid && hold_n >= 2) {
             /* deep view held: re-display cached paint for FREE unless a
@@ -840,9 +954,15 @@ int main(void)
             /* first frame of a view = quarter lattice (~0.84 s vs 6.5 s);
                once held, one full-res render upgrades the bucket key
                (fq=1) and refreshes the static cache. */
-            int fullq = (hold_n >= HOLD_FRAMES);
+            /* full-res DD upgrade at 7500 iters would be a ~7-minute frame;
+               DD views stay on the quarter lattice (~50 s first frame) */
+            int fullq = (hold_n >= HOLD_FRAMES) && !dd;
             if (pert) {
-                pert_ref(cx0, cy0, iters);
+                if (dd)
+                    pert_ref_dd(cx0, cx0 == vcx ? vcx_lo : 0.0,
+                                cy0, cy0 == vcy ? vcy_lo : 0.0, iters);
+                else
+                    pert_ref(cx0, cy0, iters);
                 /* reference bailed at pr_esc: pixels can't be meaningfully
                    iterated past it — clamp so a bad ref coord degrades to
                    the ref-escape bound instead of painting orbit garbage */
@@ -862,11 +982,22 @@ int main(void)
                             double cdx = dx * (x - W / 2);
                             double drx = 0, dri = 0;
                             for (int k = 0; k < iters; k++) {
-                                double tx = 2.0 * rr_x[k] + drx;
-                                double ty = 2.0 * rr_y[k] + dri;
-                                /* complex: d' = (2R+d)*d + dC */
-                                double nx = tx * drx - ty * dri + cdx;
-                                double ny = tx * dri + ty * drx + cdy;
+                                double nx, ny, tx, ty, txl = 0, tyl = 0, te, odx, odi;
+                                odx = drx; odi = dri;
+                                if (dd) {
+                                    tx = twosum_(2.0 * rr_x[k], odx, &te);
+                                    txl = te + 2.0 * rr_xl[k];
+                                    ty = twosum_(2.0 * rr_y[k], odi, &te);
+                                    tyl = te + 2.0 * rr_yl[k];
+                                } else {
+                                    tx = 2.0 * rr_x[k] + odx;
+                                    ty = 2.0 * rr_y[k] + odi;
+                                }
+                                /* d' = (2R+d)*d + dC */
+                                nx = tx * odx - ty * odi + cdx
+                                   + (dd ? txl * odx - tyl * odi : 0.0);
+                                ny = tx * odi + ty * odx + cdy
+                                   + (dd ? tyl * odx + txl * odi : 0.0);
                                 drx = nx; dri = ny;
                                 double zx = rr_x[k + 1] + drx;
                                 double zy = rr_y[k + 1] + dri;
@@ -917,10 +1048,21 @@ int main(void)
                             double cdx = dx * (qx * 4 - W / 2);
                             double drx = 0, dri = 0;
                             for (int k = 0; k < iters; k++) {
-                                double tx = 2.0 * rr_x[k] + drx;
-                                double ty = 2.0 * rr_y[k] + dri;
-                                double nx = tx * drx - ty * dri + cdx;
-                                double ny = tx * dri + ty * drx + cdy;
+                                double nx, ny, tx, ty, txl = 0, tyl = 0, te, odx, odi;
+                                odx = drx; odi = dri;
+                                if (dd) {
+                                    tx = twosum_(2.0 * rr_x[k], odx, &te);
+                                    txl = te + 2.0 * rr_xl[k];
+                                    ty = twosum_(2.0 * rr_y[k], odi, &te);
+                                    tyl = te + 2.0 * rr_yl[k];
+                                } else {
+                                    tx = 2.0 * rr_x[k] + odx;
+                                    ty = 2.0 * rr_y[k] + odi;
+                                }
+                                nx = tx * odx - ty * odi + cdx
+                                   + (dd ? txl * odx - tyl * odi : 0.0);
+                                ny = tx * odi + ty * odx + cdy
+                                   + (dd ? tyl * odx + txl * odi : 0.0);
                                 drx = nx; dri = ny;
                                 double zx = rr_x[k + 1] + drx;
                                 double zy = rr_y[k + 1] + dri;
@@ -1029,10 +1171,10 @@ int main(void)
         long long fps_milli = hud_fps;   /* fps * 1000 */
         if (hud_on) {
             char sp[16]; fmt_span(span, sp);
-            char xs[12], ys[12];
+            char xs[24], ys[24];
             snprintf(xs, sizeof(xs), "%.6f", cx0);
             snprintf(ys, sizeof(ys), "%.6f", cy0);
-            char l1[64], l2[64], l3[64];
+            char l1[96], l2[128], l3[96];
             snprintf(l1, sizeof(l1), "MANDEL 64  %s", view_name);
             snprintf(l2, sizeof(l2), "X%s Y%s SPAN %s %s IT%d",
                      xs, ys, sp, use_rsp ? "RSP" : "CPU", iters);
@@ -1071,17 +1213,17 @@ int main(void)
             || 1
 #endif
         ) {
-            char line[256];
+            char line[320];
             int n = snprintf(line, sizeof(line),
-                "[probe] f=%ld cx=%.17g cy=%.17g span=%.4e path=%s pert=%d mism=%d max=%d it=%d rsp_ms=%lld deep_us=%lld fps1000=%lld btn=%04X conn=%d fly=%d name=%s keys=%d morph=%d ps=%d ss=%d mm0=%d/%d/%d/%d\n",
+                "[probe] f=%ld cx=%.17g cy=%.17g span=%.4e path=%s pert=%d dd=%d mism=%d max=%d it=%d rsp_ms=%lld deep_us=%lld fps1000=%lld btn=%04X conn=%d fly=%d name=%s keys=%d morph=%d ps=%d ss=%d mm0=%d/%d/%d/%d\n",
                 (long)frame, cx0, cy0, span, use_rsp ? "rsp" : "cpu",
-                (int)(span < PERT_SPAN),
+                (int)(span < PERT_SPAN), dd,
                 mismatch, maxc, iters,
                 (long long)(us_rsp / 1000), us_deep, fps_milli, jin.btn.raw,
                 (int)joypad_is_connected(JOYPAD_PORT_1), fly_active, view_name,
                 ring_n, morphed, pal_set, screensaver,
                 mm_y[0], mm_x[0], mm_v[0], mm_r[0]);
-            static uint8_t isvbuf[256] __attribute__((aligned(8)));
+            static uint8_t isvbuf[320] __attribute__((aligned(8)));
             for (int i = 0; i < n; i++) isvbuf[i] = (uint8_t)line[i];
             for (int i = 0; i < n; i += 4) {
                 uint32_t v = 0;
